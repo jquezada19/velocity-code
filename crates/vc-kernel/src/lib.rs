@@ -5,6 +5,7 @@ pub use errors::{ErrorKind, VcError, VcResult};
 
 pub mod hash;
 pub mod index;
+pub mod journal;
 pub mod plan;
 pub mod resolve;
 pub mod root;
