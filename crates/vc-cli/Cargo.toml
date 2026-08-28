@@ -1,0 +1,24 @@
+[package]
+name = "velocity-code-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "vc"
+path = "src/main.rs"
+
+[features]
+fault-injection = ["velocity-code-kernel/fault-injection"]
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+velocity-code-kernel = { path = "../vc-kernel" }
+velocity-code-select = { path = "../vc-select" }
+
+[dev-dependencies]
+tempfile.workspace = true
+assert_cmd.workspace = true
