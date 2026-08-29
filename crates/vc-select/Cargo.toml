@@ -6,7 +6,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ast-grep-core.workspace = true
 serde.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
 velocity-code-kernel = { path = "../vc-kernel" }
 
 [dev-dependencies]
