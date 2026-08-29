@@ -12,6 +12,24 @@
 //! uncommitted journal entry (a crash mid-write — Task 10's `vc doctor`
 //! territory); `fault::point` calls mark the exact moments Task 13's
 //! crash-consistency harness needs to be able to kill the process at.
+//!
+//! Verification reads every file's bytes exactly once: `verify_files`
+//! (and `undo`'s equivalent hash-gate) hash the same bytes they hand back
+//! to their caller, so there is no second, independent read later that
+//! could observe a file a concurrent writer changed in between — nothing
+//! is ever spliced or journaled from bytes that weren't the exact bytes
+//! just verified.
+//!
+//! Once the commit marker is durable (`Journal::mark_committed` returns
+//! `Ok`), the apply or undo **is done** — every file is written, the
+//! journal entry is committed, and no later failure can undo that. So the
+//! index refresh that follows the marker is not allowed to turn a real
+//! success into a reported `Err`: a caller seeing `Err` would reasonably
+//! assume nothing happened (and might retry, racing a fresh attempt
+//! against a change that already landed). A refresh failure instead
+//! degrades to `ApplyReport.warning` — the edit is exactly as good as any
+//! other success, only the cached index may be stale until the next
+//! `vc status` rebuilds it.
 
 use crate::{ErrorKind, VcError, VcResult, fault, hash, index, journal, lock, plan};
 use std::collections::BTreeMap;
@@ -24,6 +42,12 @@ pub struct ApplyReport {
     pub files: usize,
     pub edits: usize,
     pub epoch_after: String,
+    /// Set only when the apply/undo itself fully succeeded (files
+    /// written, journal entry committed) but the write-through index
+    /// refresh that follows failed. `epoch_after` in that case is a
+    /// best-effort fallback, not a freshly-recomputed epoch — the index
+    /// is stale until `vc status` rebuilds it.
+    pub warning: Option<String>,
 }
 
 /// Verify + patch every file named by the plan at `sha_prefix`, atomically
@@ -38,7 +62,10 @@ pub fn apply_plan(root: &Path, sha_prefix: &str) -> VcResult<ApplyReport> {
     let _lock = lock::Lock::acquire(root)?;
     let p = plan::Plan::load(root, sha_prefix)?;
 
-    verify_files(root, &p)?;
+    // The only read of each file's content: verify_files hashes exactly
+    // the bytes it hands back, so nothing below re-reads the filesystem
+    // and nothing can drift between "verified" and "spliced".
+    let mut verified = verify_files(root, &p)?;
 
     if p.edits.len() != p.expected_count {
         return Err(VcError::new(
@@ -60,8 +87,12 @@ pub fn apply_plan(root: &Path, sha_prefix: &str) -> VcResult<ApplyReport> {
     let edits_by_file = group_edits_by_file(&p);
     let mut changes: Vec<(PathBuf, Vec<u8>, Vec<u8>)> = Vec::new();
     for (rel, edits) in &edits_by_file {
-        let abs = root.join(rel);
-        let pre_bytes = std::fs::read(&abs)?;
+        let pre_bytes = verified.remove(*rel).ok_or_else(|| {
+            VcError::new(
+                ErrorKind::Malformed,
+                format!("{}: no verified content for this edit", rel.display()),
+            )
+        })?;
         let pre_len = pre_bytes.len();
         let mut post_bytes = pre_bytes.clone();
         for e in edits.iter().rev() {
@@ -91,13 +122,14 @@ pub fn apply_plan(root: &Path, sha_prefix: &str) -> VcResult<ApplyReport> {
     }
 
     let files = changes.len();
-    let (journal_id, epoch_after) = commit_files(root, p.id(), changes)?;
+    let (journal_id, epoch_after, warning) = commit_files(root, p.id(), changes)?;
 
     Ok(ApplyReport {
         journal_id,
         files,
         edits: p.edits.len(),
         epoch_after,
+        warning,
     })
 }
 
@@ -118,14 +150,69 @@ pub fn undo(root: &Path, id: Option<&str>) -> VcResult<ApplyReport> {
     };
     let entry = journal::Journal::load(root, &target_id)?;
 
+    // The only read of each file's content: hash exactly the bytes we're
+    // about to reuse as the new journal entry's pre-image, so there is no
+    // later, independent re-read that could observe something else.
+    let mut current = verify_current_matches_post(root, &entry)?;
+
+    fault::point("pre_journal");
+
+    let mut changes: Vec<(PathBuf, Vec<u8>, Vec<u8>)> = Vec::new();
+    for fi in &entry.files {
+        let current_bytes = current.remove(&fi.path).ok_or_else(|| {
+            VcError::new(
+                ErrorKind::Malformed,
+                format!("{}: no verified content for this undo", fi.path.display()),
+            )
+        })?;
+        let restore_bytes = plan::b64d(&fi.pre_b64)?;
+        changes.push((fi.path.clone(), current_bytes, restore_bytes));
+    }
+    changes.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let files = changes.len();
+    let (journal_id, epoch_after, warning) = commit_files(root, entry.plan_id, changes)?;
+
+    Ok(ApplyReport {
+        journal_id,
+        files,
+        edits: 0,
+        epoch_after,
+        warning,
+    })
+}
+
+/// Single-read hash-gate for `undo`: for every file in `entry`, read its
+/// current bytes exactly once and require their hash equals the journal
+/// entry's recorded `post_hash` (i.e. nothing has touched the file since
+/// the apply/undo being reversed) — a missing file or a read error also
+/// counts as changed. Mismatches are collected across every file before
+/// refusing once (`Stale`), mirroring `verify_files`. On success, returns
+/// the bytes just read, keyed by path, so the caller never has to read
+/// the files a second time.
+fn verify_current_matches_post(
+    root: &Path,
+    entry: &journal::JournalEntry,
+) -> VcResult<BTreeMap<PathBuf, Vec<u8>>> {
     let mut stale: Vec<PathBuf> = Vec::new();
+    let mut current: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
+
     for fi in &entry.files {
         let abs = root.join(&fi.path);
-        let matches_post = hash::file_hash(&abs).is_ok_and(|h| h == fi.post_hash);
-        if !matches_post {
+        let bytes = match std::fs::read(&abs) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                stale.push(fi.path.clone());
+                continue;
+            }
+        };
+        if hash::bytes_hash(&bytes) == fi.post_hash {
+            current.insert(fi.path.clone(), bytes);
+        } else {
             stale.push(fi.path.clone());
         }
     }
+
     if !stale.is_empty() {
         return Err(VcError::new(
             ErrorKind::Stale,
@@ -133,43 +220,32 @@ pub fn undo(root: &Path, id: Option<&str>) -> VcResult<ApplyReport> {
         )
         .with_next("vc status"));
     }
-
-    fault::point("pre_journal");
-
-    let mut changes: Vec<(PathBuf, Vec<u8>, Vec<u8>)> = Vec::new();
-    for fi in &entry.files {
-        let abs = root.join(&fi.path);
-        let current_bytes = std::fs::read(&abs)?;
-        let restore_bytes = plan::b64d(&fi.pre_b64)?;
-        changes.push((fi.path.clone(), current_bytes, restore_bytes));
-    }
-    changes.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let files = changes.len();
-    let (journal_id, epoch_after) = commit_files(root, entry.plan_id, changes)?;
-
-    Ok(ApplyReport {
-        journal_id,
-        files,
-        edits: 0,
-        epoch_after,
-    })
+    Ok(current)
 }
 
 /// Verify every file the plan names, against fresh state — never the stat
-/// cache. Three checks per file, in order:
+/// cache — and return each verified file's content, read exactly once.
+/// Three checks per file, in order:
 ///   (a) `symlink_metadata` refusal — never follow a symlink at the named
 ///       path, not even to hash it (`Toctou`, refused immediately).
 ///   (b) the file's canonicalized *parent* directory must still resolve
 ///       inside `plan.root_real` — catches an ancestor directory swapped
 ///       for a symlink pointing outside the repo (`Toctou`, immediate).
-///   (c) a fresh `file_hash` must equal the plan's recorded hash. Unlike
-///       (a)/(b), staleness is collected across *every* file before
-///       refusing once, so the error names everything that changed, not
-///       just the first file the loop happened to reach. A file that has
-///       been deleted since planning counts as stale too.
-fn verify_files(root: &Path, p: &plan::Plan) -> VcResult<()> {
+///   (c) a fresh hash — computed from a single `std::fs::read`, never a
+///       second read and never the stat cache — must equal the plan's
+///       recorded hash. Unlike (a)/(b), staleness is collected across
+///       *every* file before refusing once, so the error names everything
+///       that changed, not just the first file the loop happened to
+///       reach. A file that has been deleted since planning counts as
+///       stale too.
+///
+/// On success, the returned map holds exactly the bytes that were hashed
+/// — the caller must build post-content from these, not from a fresh
+/// read, or a file changed in the gap between verification and use would
+/// be silently spliced and journaled without ever being re-checked.
+fn verify_files(root: &Path, p: &plan::Plan) -> VcResult<BTreeMap<PathBuf, Vec<u8>>> {
     let mut stale: Vec<PathBuf> = Vec::new();
+    let mut verified: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
 
     for (rel, expected_hash) in &p.files {
         let abs = root.join(rel);
@@ -200,10 +276,13 @@ fn verify_files(root: &Path, p: &plan::Plan) -> VcResult<()> {
             ));
         }
 
-        let fresh_hash = hash::file_hash(&abs)?;
+        let bytes = std::fs::read(&abs)?;
+        let fresh_hash = hash::bytes_hash(&bytes);
         if &fresh_hash != expected_hash {
             stale.push(rel.clone());
+            continue;
         }
+        verified.insert(rel.clone(), bytes);
     }
 
     if !stale.is_empty() {
@@ -213,7 +292,7 @@ fn verify_files(root: &Path, p: &plan::Plan) -> VcResult<()> {
         )
         .with_next(format!("vc plan --refresh {}", p.sha8())));
     }
-    Ok(())
+    Ok(verified)
 }
 
 /// Group `plan.edits` by path, preserving the ascending-`start` order
@@ -242,13 +321,20 @@ fn display_list(paths: &[PathBuf]) -> String {
 /// the bytes it should become ("post"), journal a pre-image, write every
 /// file through, mark the entry committed, and refresh the index.
 /// `changes` must already be in deterministic (sorted-by-path) order —
-/// both callers build it that way. Returns the new journal id and the
-/// post-refresh epoch.
+/// both callers build it that way. Returns the new journal id, the
+/// post-refresh epoch (or a best-effort fallback), and a warning if the
+/// refresh itself failed.
+///
+/// Everything through `Journal::mark_committed` can still fail as an
+/// ordinary `Err` — the apply/undo genuinely isn't done yet, so the
+/// caller needs to see that. Once `mark_committed` returns `Ok`, though,
+/// the operation *is* done, and `index::refresh` failing after that point
+/// must not turn a real success into `Err` (see the module doc comment).
 fn commit_files(
     root: &Path,
     plan_id: String,
     changes: Vec<(PathBuf, Vec<u8>, Vec<u8>)>,
-) -> VcResult<(String, String)> {
+) -> VcResult<(String, String, Option<String>)> {
     let files: Vec<journal::FileImage> = changes
         .iter()
         .map(|(path, pre, post)| journal::FileImage {
@@ -281,8 +367,34 @@ fn commit_files(
     journal::Journal::mark_committed(root, &journal_id)?;
     fault::point("post_commit_marker");
 
-    let (_ix, epoch_after) = index::refresh(root)?;
-    Ok((journal_id, epoch_after))
+    // Past this point the apply/undo is durably committed: files written,
+    // journal entry marked. A refresh failure here degrades to a warning
+    // instead of Err.
+    let (epoch_after, warning) = match index::refresh(root) {
+        Ok((_ix, epoch)) => (epoch, None),
+        Err(e) => (
+            stale_epoch_fingerprint(root),
+            Some(format!(
+                "index refresh failed: {e} — run vc status to rebuild"
+            )),
+        ),
+    };
+    Ok((journal_id, epoch_after, warning))
+}
+
+/// Best-effort fallback for `ApplyReport.epoch_after` when `index::refresh`
+/// fails after the commit marker has already landed. Deliberately *not* a
+/// recomputed epoch (that's exactly what just failed) — this hashes
+/// whatever `.vc/index` currently holds on disk (the pre-refresh, now
+/// possibly-stale index) so the field is never empty-by-coincidence with a
+/// legitimate fresh epoch, or an empty string if there's nothing to read
+/// (e.g. no index has ever been written). Either way it's paired with
+/// `warning`, which is the actual signal telling the caller not to trust
+/// it and to run `vc status`.
+fn stale_epoch_fingerprint(root: &Path) -> String {
+    std::fs::read(root.join(".vc/index"))
+        .map(|bytes| hash::bytes_hash(&bytes))
+        .unwrap_or_default()
 }
 
 /// Write `content` to `root/rel` durably and atomically: create a sibling
@@ -435,5 +547,49 @@ mod tests {
         write_through(&r, Path::new("a.rs"), b"new\n").unwrap();
         assert_eq!(std::fs::read(r.join("a.rs")).unwrap(), b"new\n");
         assert!(!r.join(".vc-tmp-a.rs").exists());
+    }
+
+    /// A post-commit `index::refresh` failure must not turn a fully
+    /// committed apply into a reported `Err` — the edit already landed
+    /// and the journal entry is already marked committed by the time
+    /// refresh runs, so the caller must see `Ok` with a `warning`, not a
+    /// failure that would make it look like nothing happened. Forces the
+    /// failure by making `.vc/index` unwritable, which `index::refresh`'s
+    /// final `ix.save` needs to overwrite.
+    #[cfg(unix)]
+    #[test]
+    fn index_refresh_failure_after_commit_degrades_to_warning_not_err() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_d, r) = setup_repo(&[("a.rs", "one\n")]);
+        let p = make_plan(&r, &[("a.rs", "one", "ONE")]);
+        let sha8 = p.store(&r).unwrap();
+
+        let index_path = r.join(".vc/index");
+        assert!(
+            index_path.is_file(),
+            "Plan::build's index::refresh already created this"
+        );
+        let writable = std::fs::metadata(&index_path).unwrap().permissions();
+        let mut readonly = writable.clone();
+        readonly.set_mode(0o400);
+        std::fs::set_permissions(&index_path, readonly).unwrap();
+
+        let result = apply_plan(&r, &sha8);
+
+        // Restore permissions unconditionally (before any assertion can
+        // panic and skip cleanup) so the tempdir can still be removed.
+        std::fs::set_permissions(&index_path, writable).unwrap();
+
+        let rep = result.expect("a post-commit refresh failure must not become Err");
+        assert!(
+            rep.warning.is_some(),
+            "refresh failure must surface as a warning"
+        );
+        assert_eq!(
+            std::fs::read_to_string(r.join("a.rs")).unwrap(),
+            "ONE\n",
+            "the edit itself still landed despite the refresh failure"
+        );
     }
 }
