@@ -396,7 +396,20 @@ fn main() {
         eprintln!("io: failed to read current directory: {e}");
         std::process::exit(1);
     });
-    let repo_root = root::find_root(&cwd);
+    // Root discovery can itself refuse (a symlinked `.vc` — B5/Toctou):
+    // routed through the same `output::emit` the rest of the CLI uses, so
+    // a refusal here gets the identical human/`--json` error envelope and
+    // exit code as any other `VcError`, just before there's a repo root
+    // to record metrics against.
+    let repo_root = match root::find_root(&cwd) {
+        Ok(p) => p,
+        Err(e) => {
+            let code = output::emit(cli.json, &Err(e));
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            std::process::exit(code);
+        }
+    };
 
     let verb = verb_name(&cli.cmd);
     let start = std::time::Instant::now();

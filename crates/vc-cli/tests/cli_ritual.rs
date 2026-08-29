@@ -455,6 +455,29 @@ fn plan_edit_missing_file_is_not_found_with_users_relative_path() {
     );
 }
 
+/// B5, end-to-end: a symlinked `.vc` must refuse at the CLI boundary too
+/// — root discovery itself fails closed, routed through the same
+/// `--json` error envelope as any other refusal.
+#[cfg(unix)]
+#[test]
+fn refuses_when_vc_is_a_symlink() {
+    let d = tempfile::tempdir().unwrap();
+    let real_vc = d.path().join("real-vc");
+    std::fs::create_dir_all(&real_vc).unwrap();
+    let repo = d.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::os::unix::fs::symlink(&real_vc, repo.join(".vc")).unwrap();
+
+    let assert = vc(&repo).args(["--json", "status"]).assert().failure();
+    let stdout = assert.get_output().stdout.clone();
+    let v: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(v["error"]["kind"].as_str().unwrap(), "toctou");
+    assert!(
+        !real_vc.join("journal").exists(),
+        "must refuse before creating anything through the symlink"
+    );
+}
+
 /// Own test: `gain` on a repo with no `.vc/metrics/` at all (nothing has
 /// ever run) succeeds with an empty aggregate rather than erroring.
 #[test]

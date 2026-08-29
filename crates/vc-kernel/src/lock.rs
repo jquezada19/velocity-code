@@ -18,6 +18,21 @@ pub struct Lock {
 
 impl Lock {
     pub fn acquire(root: &Path) -> VcResult<Lock> {
+        // Independently re-check `.vc` isn't a symlink, even though
+        // `root::find_root` already refused one on the way in — closes
+        // the window between discovery and acquisition, and protects any
+        // future caller that hands this a root that didn't go through
+        // `find_root` at all. `create_dir_all` below would happily create
+        // `.vc/journal` *through* a symlinked `.vc`, so this must run
+        // before that, not after.
+        if let Ok(md) = std::fs::symlink_metadata(root.join(".vc"))
+            && md.file_type().is_symlink()
+        {
+            return Err(VcError::new(
+                ErrorKind::Toctou,
+                ".vc: refusing to follow symlink",
+            ));
+        }
         let dir = root.join(".vc/journal");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("LOCK");
@@ -85,5 +100,27 @@ mod tests {
         assert!(!r.join(".vc/journal").exists());
         let _lock = Lock::acquire(&r).unwrap();
         assert!(r.join(".vc/journal").is_dir());
+    }
+
+    /// B5: `Lock::acquire` independently re-checks `.vc` isn't a symlink,
+    /// even though `root::find_root` already checked it on the way in —
+    /// a defense against the window between discovery and acquisition,
+    /// and against any future caller that hands `Lock::acquire` a root
+    /// that didn't go through `find_root` at all.
+    #[cfg(unix)]
+    #[test]
+    fn acquire_refuses_when_vc_is_a_symlink() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().to_path_buf();
+        let real_vc = d.path().join("real-vc");
+        std::fs::create_dir_all(&real_vc).unwrap();
+        std::os::unix::fs::symlink(&real_vc, r.join(".vc")).unwrap();
+
+        let err = Lock::acquire(&r).unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::Toctou));
+        assert!(
+            !real_vc.join("journal").exists(),
+            "must refuse before creating anything through the symlink"
+        );
     }
 }
