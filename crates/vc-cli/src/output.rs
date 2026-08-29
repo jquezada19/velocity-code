@@ -27,6 +27,18 @@ pub struct CmdOutcome {
     /// (`ApplyReport.warning`). Printed to stderr even on the success
     /// path — it is not a failure, just a "run `vc status`" heads-up.
     pub warning: Option<String>,
+    /// Read-side gain accounting (Task 15, spec §7.2): bytes of the
+    /// rendered `human` output. `Some` only for the read verbs
+    /// (`query`/`outline`/`read`) — every other verb leaves this `None`,
+    /// and `main`'s metrics line omits the field entirely rather than
+    /// recording a meaningless `0`.
+    pub bytes_out: Option<u64>,
+    /// Read-side gain accounting's counterfactual: what it would have
+    /// cost to read the file(s) naively instead — sum of the full sizes
+    /// of every file that contributed a hit for `query`, or the target
+    /// file's full size for `outline`/`read`. `Some` only alongside
+    /// `bytes_out`.
+    pub naive_bytes: Option<u64>,
 }
 
 /// Mirrors `velocity_code_kernel::errors::ErrorKind`'s private `label()`
@@ -137,6 +149,8 @@ mod tests {
             edits: 0,
             epoch8: String::new(),
             warning: None,
+            bytes_out: None,
+            naive_bytes: None,
         };
         assert_eq!(emit(true, &Ok(outcome)), 0);
     }

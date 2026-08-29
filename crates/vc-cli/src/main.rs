@@ -63,11 +63,23 @@ enum Cmd {
         #[arg(long)]
         regex: bool,
         /// Symbol-name search instead of literal/regex content search
-        /// (`vc query NAME --symbol`). Mutually exclusive with `--regex` —
-        /// checked in `cmd_query`, not `clap`, so the refusal routes
-        /// through the normal `VcError`/`--json` envelope.
+        /// (`vc query NAME --symbol`). Mutually exclusive with `--regex`
+        /// and `--ast` — checked in `cmd_query`, not `clap`, so the
+        /// refusal routes through the normal `VcError`/`--json` envelope.
         #[arg(long)]
         symbol: bool,
+        /// Structural (AST) search instead of literal/regex/symbol search
+        /// (`vc query PATTERN --ast`) — the same `ast-grep` engine `plan
+        /// match` uses, dry-run: `pattern` is matched with an unused empty
+        /// rewrite and every site renders as a query hit at its start
+        /// line. Mutually exclusive with `--regex` and `--symbol`. `lang`
+        /// is inferred the same way `plan match` infers it (one supported
+        /// language present in scope -> use it; a mix -> `Usage`; none ->
+        /// `Usage`) unless pinned explicitly.
+        #[arg(long)]
+        ast: bool,
+        #[arg(long)]
+        lang: Option<String>,
         #[arg(long)]
         budget: Option<usize>,
         paths: Vec<std::path::PathBuf>,
@@ -167,9 +179,21 @@ fn dispatch(root: &Path, cwd: &Path, cmd: &Cmd) -> VcResult<CmdOutcome> {
             pattern,
             regex,
             symbol,
+            ast,
+            lang,
             budget,
             paths,
-        } => cmd_query(root, cwd, pattern, *regex, *symbol, *budget, paths),
+        } => cmd_query(
+            root,
+            cwd,
+            pattern,
+            *regex,
+            *symbol,
+            *ast,
+            lang.as_deref(),
+            *budget,
+            paths,
+        ),
         Cmd::Outline { path, budget } => cmd_outline(root, cwd, path, *budget),
         Cmd::Read {
             path,
@@ -337,6 +361,8 @@ fn cmd_plan(root: &Path, cwd: &Path, form: &PlanCmd) -> VcResult<CmdOutcome> {
         edits: sites,
         epoch8,
         warning,
+        bytes_out: None,
+        naive_bytes: None,
     })
 }
 
@@ -383,14 +409,21 @@ fn describe_scope(paths: &[std::path::PathBuf]) -> String {
 /// pass --lang"`); none -> `Usage` naming the scope. Returns a fully built
 /// (not yet stored) `Plan` — the caller stores it and reports; on an
 /// `--expect` mismatch, nothing is built or stored at all.
-fn plan_match_pipeline(
+/// Shared walk + language inference behind both `vc plan match`'s pipeline
+/// and `vc query --ast` (Task 15): walks `scope_paths` (empty = whole
+/// tree), then either uses the explicit `lang` outright or infers it from
+/// the walked scope's `lang_tag`s — one distinct supported language
+/// present -> use it; more than one -> `Usage` naming the mix (`"scope
+/// spans rust+python — pass --lang"`); none -> `Usage` naming the scope.
+/// Returns `(lang, scope_files)`, the lang-filtered file list every
+/// caller hands to `match_sites`. Factored out of `plan_match_pipeline`
+/// so `query --ast` picks the same language the same way `plan match`
+/// does, rather than a second copy of this logic drifting from it.
+fn infer_scope_lang(
     root: &Path,
     scope_paths: &[std::path::PathBuf],
     lang: Option<&str>,
-    pattern: &str,
-    rewrite: &str,
-    expect: Option<usize>,
-) -> VcResult<Plan> {
+) -> VcResult<(String, Vec<std::path::PathBuf>)> {
     let walked = walk::walk_scoped(root, scope_paths)?;
 
     let lang = match lang {
@@ -427,6 +460,19 @@ fn plan_match_pipeline(
 
     let scope_files: Vec<std::path::PathBuf> =
         walked.into_iter().filter(|p| lang_tag(p) == lang).collect();
+
+    Ok((lang, scope_files))
+}
+
+fn plan_match_pipeline(
+    root: &Path,
+    scope_paths: &[std::path::PathBuf],
+    lang: Option<&str>,
+    pattern: &str,
+    rewrite: &str,
+    expect: Option<usize>,
+) -> VcResult<Plan> {
+    let (lang, scope_files) = infer_scope_lang(root, scope_paths, lang)?;
 
     let (sites, content_by_path, warnings) =
         match_sites(root, pattern, rewrite, &lang, &scope_files)?;
@@ -506,6 +552,8 @@ fn cmd_show(root: &Path, sha8: &str) -> VcResult<CmdOutcome> {
         edits,
         epoch8,
         warning: None,
+        bytes_out: None,
+        naive_bytes: None,
     })
 }
 
@@ -654,6 +702,8 @@ fn cmd_apply(root: &Path, sha8: &str) -> VcResult<CmdOutcome> {
         edits: report.edits,
         epoch8,
         warning: report.warning,
+        bytes_out: None,
+        naive_bytes: None,
     })
 }
 
@@ -672,6 +722,8 @@ fn cmd_undo(root: &Path, id: Option<&str>) -> VcResult<CmdOutcome> {
         edits: report.edits,
         epoch8,
         warning: report.warning,
+        bytes_out: None,
+        naive_bytes: None,
     })
 }
 
@@ -722,6 +774,8 @@ fn cmd_status(root: &Path) -> VcResult<CmdOutcome> {
         edits: 0,
         epoch8,
         warning: None,
+        bytes_out: None,
+        naive_bytes: None,
     })
 }
 
@@ -760,6 +814,8 @@ fn cmd_doctor(root: &Path, rollback: bool, discard: bool) -> VcResult<CmdOutcome
         edits: 0,
         epoch8: String::new(),
         warning: None,
+        bytes_out: None,
+        naive_bytes: None,
     })
 }
 
@@ -774,38 +830,67 @@ fn cmd_gain(root: &Path, history: bool) -> VcResult<CmdOutcome> {
         edits: 0,
         epoch8: String::new(),
         warning: None,
+        bytes_out: None,
+        naive_bytes: None,
     })
 }
 
-/// `vc query <PATTERN> [--regex] [--symbol] [--budget N] [paths…]` —
-/// read-only search, never touches a user file. `paths` (empty = whole
-/// tree) are rebased per-argument through the same [`rebase_user_path`]
-/// `plan edit` uses, so a scope path is interpreted relative to the CWD the
-/// same way a `plan edit` file argument is, and a path escaping `root`
-/// refuses the same way (`Usage`, exit 2). The epoch stamp comes from a
-/// fresh `index::refresh` — unlike `plan`/`apply`, `query` has no stored
-/// plan to read an epoch off, so it takes the live one directly, same
-/// source `vc status` reads. Zero hits is success (exit 0), not an error:
-/// an agent needs to tell "found nothing" apart from "the command failed."
+/// Sum of the on-disk sizes of every distinct file in `files` — the
+/// read-side gain accounting's `naive_bytes` counterfactual for a query
+/// mode (spec §7.2): "what would it have cost to just read every file
+/// that contributed a hit." An unreadable/vanished file (a race between
+/// the search read and this stat) contributes `0` rather than failing the
+/// whole command — this is observability, not correctness, same posture
+/// `metrics::record` itself takes.
+fn naive_bytes_for_files<'a>(
+    root: &Path,
+    files: impl IntoIterator<Item = &'a std::path::PathBuf>,
+) -> u64 {
+    files
+        .into_iter()
+        .map(|p| {
+            std::fs::metadata(root.join(p))
+                .map(|m| m.len())
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+/// `vc query <PATTERN> [--regex] [--symbol] [--ast] [--budget N]
+/// [paths…]` — read-only search, never touches a user file. `paths`
+/// (empty = whole tree) are rebased per-argument through the same
+/// [`rebase_user_path`] `plan edit` uses, so a scope path is interpreted
+/// relative to the CWD the same way a `plan edit` file argument is, and a
+/// path escaping `root` refuses the same way (`Usage`, exit 2). The epoch
+/// stamp comes from a fresh `index::refresh` — unlike `plan`/`apply`,
+/// `query` has no stored plan to read an epoch off, so it takes the live
+/// one directly, same source `vc status` reads. Zero hits is success
+/// (exit 0), not an error: an agent needs to tell "found nothing" apart
+/// from "the command failed."
 ///
-/// `--symbol` switches to name-based symbol search (`velocity_code_query::
-/// search_symbol`) and is mutually exclusive with `--regex` — checked here
-/// (not via `clap`'s `conflicts_with`) so the refusal routes through the
-/// same `VcError`/`--json` envelope as every other error, same pattern as
-/// `cmd_doctor`'s `--rollback`/`--discard` check.
+/// `--symbol`, `--regex`, and `--ast` are three separate search modes,
+/// mutually exclusive with each other — checked here (not via `clap`'s
+/// `conflicts_with`) so the refusal routes through the same
+/// `VcError`/`--json` envelope as every other error, same pattern as
+/// `cmd_doctor`'s `--rollback`/`--discard` check. `--ast` switches to
+/// structural search (`cmd_query_ast`), the same `ast-grep` engine `plan
+/// match` uses — literally the dry-run of the edit.
+#[allow(clippy::too_many_arguments)]
 fn cmd_query(
     root: &Path,
     cwd: &Path,
     pattern: &str,
     regex: bool,
     symbol: bool,
+    ast: bool,
+    lang: Option<&str>,
     budget: Option<usize>,
     paths: &[std::path::PathBuf],
 ) -> VcResult<CmdOutcome> {
-    if symbol && regex {
+    if [symbol, regex, ast].iter().filter(|&&b| b).count() > 1 {
         return Err(VcError::new(
             ErrorKind::Usage,
-            "query: --symbol and --regex are mutually exclusive",
+            "query: --symbol, --regex, and --ast are mutually exclusive",
         ));
     }
 
@@ -819,6 +904,9 @@ fn cmd_query(
 
     if symbol {
         return cmd_query_symbol(root, pattern, budget, &scope, epoch8);
+    }
+    if ast {
+        return cmd_query_ast(root, pattern, lang, budget, &scope, epoch8);
     }
 
     let hits = if regex {
@@ -863,11 +951,11 @@ fn cmd_query(
         "elided": budgeted.elided,
     });
 
-    let files = hits
-        .iter()
-        .map(|h| &h.path)
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
+    let unique_files: std::collections::BTreeSet<&std::path::PathBuf> =
+        hits.iter().map(|h| &h.path).collect();
+    let files = unique_files.len();
+    let bytes_out = human.len() as u64;
+    let naive_bytes = naive_bytes_for_files(root, unique_files);
 
     Ok(CmdOutcome {
         human,
@@ -876,6 +964,8 @@ fn cmd_query(
         edits: n,
         epoch8,
         warning: None,
+        bytes_out: Some(bytes_out),
+        naive_bytes: Some(naive_bytes),
     })
 }
 
@@ -939,11 +1029,11 @@ fn cmd_query_symbol(
         "elided": budgeted.elided,
     });
 
-    let files = hits
-        .iter()
-        .map(|h| &h.path)
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
+    let unique_files: std::collections::BTreeSet<&std::path::PathBuf> =
+        hits.iter().map(|h| &h.path).collect();
+    let files = unique_files.len();
+    let bytes_out = human.len() as u64;
+    let naive_bytes = naive_bytes_for_files(root, unique_files);
     // Multiple per-file parse warnings collapse into CmdOutcome's single
     // `warning` slot (the same one apply/undo use for a non-fatal,
     // surfaced-but-not-failing condition) — joined rather than dropped, so
@@ -961,6 +1051,86 @@ fn cmd_query_symbol(
         edits: n,
         epoch8,
         warning,
+        bytes_out: Some(bytes_out),
+        naive_bytes: Some(naive_bytes),
+    })
+}
+
+/// `vc query PATTERN --ast [--lang L]` handler, split out of [`cmd_query`]
+/// for the same reason `cmd_query_symbol` is: its hit source (structural
+/// match sites, not a line/regex scan) and language-inference step
+/// genuinely diverge from the literal/regex path. `lang` resolution goes
+/// through [`infer_scope_lang`] — the exact function `plan_match_pipeline`
+/// uses — so `--ast`'s auto-detect and refusal messages match `plan
+/// match`'s precisely rather than a second, drifting copy. Rendering,
+/// budgeting, `--json` shape, and read-gain accounting are otherwise
+/// identical to `cmd_query`'s literal/regex path — both work over
+/// `Vec<QueryHit>`.
+fn cmd_query_ast(
+    root: &Path,
+    pattern: &str,
+    lang: Option<&str>,
+    budget: Option<usize>,
+    scope: &[std::path::PathBuf],
+    epoch8: String,
+) -> VcResult<CmdOutcome> {
+    let (lang, scope_files) = infer_scope_lang(root, scope, lang)?;
+    let (hits, warnings) = velocity_code_query::search_ast(root, pattern, &lang, &scope_files)?;
+    let n = hits.len();
+    let budgeted = velocity_code_query::render_hits(&hits, budget);
+
+    let mut human = format!("epoch {epoch8} — {n} hits\n");
+    if !budgeted.text.is_empty() {
+        human.push_str(&budgeted.text);
+        human.push('\n');
+    }
+    if budgeted.elided > 0 {
+        human.push_str(&format!("… elided {} hits (budget)\n", budgeted.elided));
+    }
+
+    // Same "included = total - elided, slice the front" reasoning as
+    // cmd_query's literal/regex path.
+    let included = n - budgeted.elided;
+    let json_hits: Vec<serde_json::Value> = hits[..included]
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "path": h.path.to_string_lossy(),
+                "line": h.line,
+                "col": h.col,
+                "text": h.line_text,
+            })
+        })
+        .collect();
+    let json = serde_json::json!({
+        "epoch8": epoch8,
+        "hits": json_hits,
+        "elided": budgeted.elided,
+    });
+
+    let unique_files: std::collections::BTreeSet<&std::path::PathBuf> =
+        hits.iter().map(|h| &h.path).collect();
+    let files = unique_files.len();
+    let bytes_out = human.len() as u64;
+    let naive_bytes = naive_bytes_for_files(root, unique_files);
+    // Same non-fatal-warning posture as `cmd_query_symbol`/`plan match`:
+    // a file `match_sites` had to skip (non-UTF8, or an error-containing
+    // parse tree) must not fail a query that still found real sites.
+    let warning = if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join("; "))
+    };
+
+    Ok(CmdOutcome {
+        human,
+        json,
+        files,
+        edits: n,
+        epoch8,
+        warning,
+        bytes_out: Some(bytes_out),
+        naive_bytes: Some(naive_bytes),
     })
 }
 
@@ -1000,6 +1170,9 @@ fn cmd_outline(
         "elided": elided,
     });
 
+    let bytes_out = human.len() as u64;
+    let naive_bytes = src.len() as u64;
+
     Ok(CmdOutcome {
         human,
         json,
@@ -1007,6 +1180,8 @@ fn cmd_outline(
         edits: 0,
         epoch8,
         warning: None,
+        bytes_out: Some(bytes_out),
+        naive_bytes: Some(naive_bytes),
     })
 }
 
@@ -1125,6 +1300,9 @@ fn cmd_read_path(
         "text": text,
     });
 
+    let bytes_out = human.len() as u64;
+    let naive_bytes = content.len() as u64;
+
     Ok(CmdOutcome {
         human,
         json,
@@ -1132,6 +1310,8 @@ fn cmd_read_path(
         edits: 0,
         epoch8,
         warning: None,
+        bytes_out: Some(bytes_out),
+        naive_bytes: Some(naive_bytes),
     })
 }
 
@@ -1204,6 +1384,9 @@ fn cmd_read_symbol(root: &Path, name: &str, budget: Option<usize>) -> VcResult<C
         Some(warnings.join("; "))
     };
 
+    let bytes_out = human.len() as u64;
+    let naive_bytes = content.len() as u64;
+
     Ok(CmdOutcome {
         human,
         json,
@@ -1211,6 +1394,8 @@ fn cmd_read_symbol(root: &Path, name: &str, budget: Option<usize>) -> VcResult<C
         edits: 0,
         epoch8,
         warning,
+        bytes_out: Some(bytes_out),
+        naive_bytes: Some(naive_bytes),
     })
 }
 
@@ -1261,11 +1446,35 @@ fn main() {
     let result = dispatch(&repo_root, &cwd, &cli.cmd);
     let ms = start.elapsed().as_millis() as u64;
 
-    let (files, edits, epoch8, refusal) = match &result {
-        Ok(o) => (o.files, o.edits, o.epoch8.clone(), None),
-        Err(e) => (0, 0, String::new(), Some(output::error_kind_label(e.kind))),
+    let (files, edits, epoch8, refusal, bytes_out, naive_bytes) = match &result {
+        Ok(o) => (
+            o.files,
+            o.edits,
+            o.epoch8.clone(),
+            None,
+            o.bytes_out,
+            o.naive_bytes,
+        ),
+        Err(e) => (
+            0,
+            0,
+            String::new(),
+            Some(output::error_kind_label(e.kind)),
+            None,
+            None,
+        ),
     };
-    metrics::record(&repo_root, verb, ms, files, edits, refusal, &epoch8);
+    metrics::record(
+        &repo_root,
+        verb,
+        ms,
+        files,
+        edits,
+        refusal,
+        &epoch8,
+        bytes_out,
+        naive_bytes,
+    );
 
     let code = output::emit(cli.json, &result);
     use std::io::Write as _;

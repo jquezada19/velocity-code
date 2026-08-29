@@ -492,5 +492,8 @@ fn gain_on_empty_metrics_does_not_error() {
         .stdout
         .clone();
     let text = String::from_utf8(out).unwrap();
-    assert!(text.contains("reads: n/a until M2"));
+    assert!(
+        text.contains("read savings: 0 bytes (0%) across 0 read-verb calls"),
+        "got: {text}"
+    );
 }

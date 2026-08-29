@@ -1047,6 +1047,7 @@ dependencies = [
  "tempfile",
  "velocity-code-kernel",
  "velocity-code-lang",
+ "velocity-code-select",
 ]
 
 [[package]]

@@ -236,6 +236,63 @@ pub fn search_symbol(
     }
 }
 
+/// AST-structural search — the query-mode twin of `vc plan match`'s
+/// engine, so `vc query --ast` is literally the dry run of the edit
+/// (Task 15). Dispatches to [`velocity_code_select::match_sites`] with an
+/// empty rewrite (`""` — the rewrite output is unused for a read-only
+/// query, and an empty rewrite is explicitly legal there) and renders
+/// each returned [`velocity_code_select::MatchSite`] as a [`QueryHit`] at
+/// the match's start byte, through the exact same `locate()` byte-offset
+/// -> (line, col, line_text) mapping `search_literal`/`search_regex` use
+/// — built from the file's own newline index, not `match_sites`'s span.
+///
+/// `scope_files` must already be language-filtered by the caller (same
+/// contract `match_sites` itself documents) — the CLI does this via the
+/// shared lang-inference pipeline `plan match` uses. Returns `(hits,
+/// warnings)`: `warnings` is `match_sites`'s own per-file skip
+/// diagnostics (not valid UTF-8, or a parse tree containing an error),
+/// passed through unchanged for the caller to surface exactly like
+/// `plan match`'s `plan.warnings` and `search_symbol`'s `warnings` do.
+pub fn search_ast(
+    root: &Path,
+    pattern: &str,
+    lang: &str,
+    scope_files: &[PathBuf],
+) -> VcResult<(Vec<QueryHit>, Vec<String>)> {
+    let (sites, content_by_path, warnings) =
+        velocity_code_select::match_sites(root, pattern, "", lang, scope_files)?;
+
+    let mut hits = Vec::with_capacity(sites.len());
+    for site in &sites {
+        // `match_sites` only omits a file from `content_by_path` when it
+        // produced zero sites — every site's own path is guaranteed
+        // present, so this is a defensive skip, never expected to fire.
+        let Some(bytes) = content_by_path.get(&site.path) else {
+            continue;
+        };
+        let newlines: Vec<usize> = memchr_iter(b'\n', bytes).collect();
+        let (line, col, line_text) = locate(bytes, &newlines, site.start);
+        hits.push(QueryHit {
+            path: site.path.clone(),
+            line,
+            col,
+            line_text,
+        });
+    }
+    // `match_sites` sorts by `(path, start)`; re-sort by `(path, line,
+    // col)` to guarantee the same ordering contract `search_literal`/
+    // `search_regex` pin, rather than relying on the two orderings
+    // happening to coincide.
+    hits.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.line.cmp(&b.line))
+            .then(a.col.cmp(&b.col))
+    });
+
+    Ok((hits, warnings))
+}
+
 fn is_binary(bytes: &[u8]) -> bool {
     let sniff_len = bytes.len().min(BINARY_SNIFF_LEN);
     bytes[..sniff_len].contains(&0u8)
@@ -470,6 +527,55 @@ mod tests {
             warnings.is_empty(),
             "a non-indexed-as-rust file must not even be attempted: {:?}",
             warnings
+        );
+    }
+
+    #[test]
+    fn ast_search_finds_call_site_and_locates_it_via_newline_index() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("a.rs"),
+            "fn main() {\n    fetch_config(a);\n}\n",
+        )
+        .unwrap();
+        let (hits, warnings) = search_ast(
+            d.path(),
+            "fetch_config($$$A)",
+            "rust",
+            &[PathBuf::from("a.rs")],
+        )
+        .unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, PathBuf::from("a.rs"));
+        assert_eq!(hits[0].line, 2);
+        assert_eq!(hits[0].col, 5);
+        assert_eq!(hits[0].line_text, "    fetch_config(a);");
+    }
+
+    #[test]
+    fn ast_search_finds_every_call_site_across_files() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("a.rs"),
+            "fn main() { fetch_config(a); fetch_config(b); }\n",
+        )
+        .unwrap();
+        std::fs::write(d.path().join("b.rs"), "fn other() { fetch_config(c); }\n").unwrap();
+        let (hits, _warnings) = search_ast(
+            d.path(),
+            "fetch_config($$$A)",
+            "rust",
+            &[PathBuf::from("a.rs"), PathBuf::from("b.rs")],
+        )
+        .unwrap();
+        let got: Vec<(String, usize)> = hits
+            .iter()
+            .map(|h| (h.path.display().to_string(), h.line))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("a.rs".into(), 1), ("a.rs".into(), 1), ("b.rs".into(), 1)]
         );
     }
 
