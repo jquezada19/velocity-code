@@ -66,7 +66,32 @@ impl Plan {
         let root_real = root
             .canonicalize()
             .map_err(|e| VcError::new(ErrorKind::Io, format!("{}: {e}", root.display())))?;
-        let edits = resolve::resolve_edits(&root_real, reqs)?;
+        // Single read per file: resolution and hashing both work from the
+        // exact bytes read here — no second, independent read later that
+        // could observe a file changed in between (see
+        // `resolve::resolve_edits_with_content`'s doc comment).
+        let (edits, content_by_path) = resolve::resolve_edits_with_content(&root_real, reqs)?;
+
+        // Defense in depth (the CLI's `rebase_user_path` already rebases
+        // and root-checks `plan edit`'s file argument): an edit whose path
+        // is absolute or escapes via `..` must never reach `files`/
+        // `realpaths` — `root_real.join(&edit.path)` would silently ignore
+        // `root_real` altogether for an absolute path, and a `..`
+        // component can walk back out of it either way. A diff import's
+        // internal paths, or a stored plan replayed through `plan
+        // refresh`, are the realistic sources of an edit path this
+        // untrusted.
+        for edit in &edits {
+            if !crate::path_is_root_relative(&edit.path) {
+                return Err(VcError::new(
+                    ErrorKind::Usage,
+                    format!(
+                        "{}: edit path must be relative with no '..' components",
+                        edit.path.display()
+                    ),
+                ));
+            }
+        }
 
         let mut files = BTreeMap::new();
         let mut realpaths = BTreeMap::new();
@@ -75,7 +100,10 @@ impl Plan {
                 continue;
             }
             let abs = root_real.join(&edit.path);
-            let file_hash = hash::file_hash(&abs)?;
+            let content = content_by_path
+                .get(&edit.path)
+                .expect("resolve_edits_with_content reads every touched file");
+            let file_hash = hash::bytes_hash(content);
             let real = abs
                 .canonicalize()
                 .map_err(|e| VcError::new(ErrorKind::Io, format!("{}: {e}", abs.display())))?;
@@ -159,8 +187,24 @@ impl Plan {
             ),
             1 => {
                 let bytes = std::fs::read(&matches[0])?;
-                serde_json::from_slice(&bytes)
-                    .map_err(|e| VcError::new(ErrorKind::Malformed, format!("plan {prefix}: {e}")))
+                let plan: Plan = serde_json::from_slice(&bytes).map_err(|e| {
+                    VcError::new(ErrorKind::Malformed, format!("plan {prefix}: {e}"))
+                })?;
+                // Content-addressed integrity: the filename IS the plan's
+                // own digest of itself (see `store`), so a hand-edited
+                // plan file (still-valid JSON, different content) must be
+                // caught here rather than trusted just because it parses.
+                let filename_id = matches[0]
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default();
+                if plan.id() != filename_id {
+                    return Err(VcError::new(
+                        ErrorKind::Malformed,
+                        "plan file does not match its id",
+                    ));
+                }
+                Ok(plan)
             }
             n => Err(VcError::new(
                 ErrorKind::Ambiguous,
@@ -245,6 +289,30 @@ mod tests {
         ));
     }
 
+    /// A: `load` recomputes the digest of what it just deserialized and
+    /// refuses if it no longer matches the filename that named it — a
+    /// hand-edited plan file (same address, different content) must be
+    /// caught here, not silently trusted just because the JSON parses.
+    #[test]
+    fn load_refuses_a_plan_file_whose_content_was_tampered_after_storing() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        std::fs::create_dir_all(root.join(".vc")).unwrap();
+        let p = sample_plan();
+        let sha8 = p.store(root).unwrap();
+        let full_id = p.id();
+        let path = plans_dir(root).join(format!("{full_id}.json"));
+
+        let mut on_disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        on_disk["edits"][0]["new_b64"] = serde_json::json!(base64e(b"tampered"));
+        std::fs::write(&path, serde_json::to_vec_pretty(&on_disk).unwrap()).unwrap();
+
+        let err = Plan::load(root, &sha8).unwrap_err();
+        assert!(matches!(err.kind, crate::ErrorKind::Malformed));
+        assert_eq!(err.message, "plan file does not match its id");
+    }
+
     #[test]
     fn preview_shows_header_and_prefixed_old_new_lines() {
         let p = sample_plan();
@@ -302,6 +370,92 @@ mod tests {
 
         assert_eq!(p.edits.len(), 2);
         assert_eq!(p.files.len(), 1, "one entry per touched file, not per edit");
+    }
+
+    /// B1: an edit request whose resolved path is absolute must be refused
+    /// (`Usage`) rather than stored — `root_real.join(&edit.path)` would
+    /// silently ignore `root_real` entirely for an absolute path
+    /// (`Path::join` replaces, not appends), so `Plan::build` must reject
+    /// it before ever joining. Uses a genuinely separate tempdir (not a
+    /// real system file) so the test is portable and never touches a real
+    /// file's content.
+    #[test]
+    fn build_refuses_an_edit_path_that_is_absolute() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().join("repo");
+        std::fs::create_dir_all(r.join(".vc")).unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, "one\n").unwrap();
+
+        let reqs = vec![resolve::EditRequest {
+            path: outside_file.clone(),
+            old: b"one".to_vec(),
+            new: b"ONE".to_vec(),
+            line_hint: None,
+        }];
+        let err = Plan::build(&r, PlanForm::Edit, &reqs).unwrap_err();
+        assert!(matches!(err.kind, crate::ErrorKind::Usage));
+        assert_eq!(
+            std::fs::read_to_string(&outside_file).unwrap(),
+            "one\n",
+            "file outside root must be untouched by the refusal"
+        );
+    }
+
+    /// B1, `..` variant: a path reachable only via a parent-dir component
+    /// must be refused the same way, even though `resolve_edits` happily
+    /// reads it (root-escape checking is `Plan::build`'s job, not
+    /// resolve's).
+    #[test]
+    fn build_refuses_an_edit_path_containing_a_dotdot_component() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().join("repo");
+        std::fs::create_dir_all(r.join(".vc")).unwrap();
+        // Sibling of the repo root, reachable only via `..`.
+        std::fs::write(d.path().join("escape.txt"), "one\n").unwrap();
+
+        let reqs = vec![resolve::EditRequest {
+            path: PathBuf::from("../escape.txt"),
+            old: b"one".to_vec(),
+            new: b"ONE".to_vec(),
+            line_hint: None,
+        }];
+        let err = Plan::build(&r, PlanForm::Edit, &reqs).unwrap_err();
+        assert!(matches!(err.kind, crate::ErrorKind::Usage));
+    }
+
+    /// D: `Plan::build`'s recorded hash must equal the hash of the exact
+    /// bytes `resolve_edits_with_content` read to compute the edit's
+    /// offsets — not a second, independent read. There is no test hook to
+    /// interleave a mutation between the two (there is no "two" any
+    /// more — that's the point), so this pins the observable contract the
+    /// task describes: build's hash matches a hash of bytes read at
+    /// essentially the same moment resolution ran, from the one buffer
+    /// resolution actually saw.
+    #[test]
+    fn build_hash_reflects_the_single_read_resolve_saw() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().to_path_buf();
+        std::fs::create_dir_all(r.join(".vc")).unwrap();
+        let content = b"fn one() { let v = 1; }\n";
+        std::fs::write(r.join("a.rs"), content).unwrap();
+        let pre_read = std::fs::read(r.join("a.rs")).unwrap();
+
+        let reqs = vec![resolve::EditRequest {
+            path: "a.rs".into(),
+            old: b"one".to_vec(),
+            new: b"uno".to_vec(),
+            line_hint: None,
+        }];
+        let p = Plan::build(&r, PlanForm::Edit, &reqs).unwrap();
+
+        assert_eq!(
+            p.files.get(&PathBuf::from("a.rs")),
+            Some(&crate::hash::bytes_hash(&pre_read)),
+            "build's recorded hash must equal bytes_hash of the content resolve saw"
+        );
     }
 
     #[test]

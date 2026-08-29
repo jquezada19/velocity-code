@@ -1,6 +1,11 @@
 use crate::plan::{ResolvedEdit, b64e};
 use crate::{ErrorKind, VcError, VcResult};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// Every unique path `resolve_edits_with_content` read, keyed by its
+/// root-relative path.
+pub type ContentByPath = BTreeMap<PathBuf, Vec<u8>>;
 
 #[derive(Debug)]
 pub struct EditRequest {
@@ -29,16 +34,33 @@ fn line_of(hay: &[u8], byte: usize) -> usize {
     1 + hay[..byte].iter().filter(|&&b| b == b'\n').count()
 }
 
-pub fn resolve_edits(root: &Path, reqs: &[EditRequest]) -> VcResult<Vec<ResolvedEdit>> {
+/// Resolve `reqs` and return, alongside the resolved edits, every touched
+/// file's content as read to resolve them — each unique path read from
+/// disk exactly once, even when multiple requests target the same file.
+/// `resolve_edits` is a thin wrapper over this that discards the content
+/// map; `Plan::build` uses this directly so its hash comes from the exact
+/// bytes resolution saw rather than a second, independent read (a
+/// plan-time TOCTOU: without this, a file that changed between resolve's
+/// read and a later hashing read could record a hash that doesn't
+/// correspond to the offsets computed against the first read).
+pub fn resolve_edits_with_content(
+    root: &Path,
+    reqs: &[EditRequest],
+) -> VcResult<(Vec<ResolvedEdit>, ContentByPath)> {
+    let mut content_by_path: ContentByPath = BTreeMap::new();
     let mut out: Vec<ResolvedEdit> = Vec::new();
     for req in reqs {
-        let content = std::fs::read(root.join(&req.path)).map_err(|_| {
-            VcError::new(
-                ErrorKind::NotFound,
-                format!("{}: no such file", req.path.display()),
-            )
-        })?;
-        let hits = find_all(&content, &req.old);
+        if !content_by_path.contains_key(&req.path) {
+            let bytes = std::fs::read(root.join(&req.path)).map_err(|_| {
+                VcError::new(
+                    ErrorKind::NotFound,
+                    format!("{}: no such file", req.path.display()),
+                )
+            })?;
+            content_by_path.insert(req.path.clone(), bytes);
+        }
+        let content = &content_by_path[&req.path];
+        let hits = find_all(content, &req.old);
         let start = match (hits.len(), req.line_hint) {
             (0, _) => {
                 return Err(VcError::new(
@@ -51,7 +73,7 @@ pub fn resolve_edits(root: &Path, reqs: &[EditRequest]) -> VcResult<Vec<Resolved
                 let at: Vec<usize> = hits
                     .iter()
                     .copied()
-                    .filter(|&h| line_of(&content, h) == hint)
+                    .filter(|&h| line_of(content, h) == hint)
                     .collect();
                 match at.len() {
                     1 => at[0],
@@ -101,7 +123,13 @@ pub fn resolve_edits(root: &Path, reqs: &[EditRequest]) -> VcResult<Vec<Resolved
             ));
         }
     }
-    Ok(out)
+    Ok((out, content_by_path))
+}
+
+/// Thin wrapper over [`resolve_edits_with_content`] for callers that only
+/// need the resolved edits, not the content read along the way.
+pub fn resolve_edits(root: &Path, reqs: &[EditRequest]) -> VcResult<Vec<ResolvedEdit>> {
+    resolve_edits_with_content(root, reqs).map(|(edits, _)| edits)
 }
 
 #[cfg(test)]
