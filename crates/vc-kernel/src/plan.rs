@@ -1,4 +1,4 @@
-use crate::{ErrorKind, VcError, VcResult};
+use crate::{ErrorKind, VcError, VcResult, hash, index, resolve};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -53,6 +53,56 @@ fn plans_dir(root: &Path) -> PathBuf {
 }
 
 impl Plan {
+    /// Build a plan from edit requests against `root`: canonicalize the
+    /// root, resolve every edit (exact-unique match, overlap-checked,
+    /// sorted by `(path, start)` — see `resolve::resolve_edits`), snapshot
+    /// each touched file's current hash and canonical realpath, and stamp
+    /// the current write-through index epoch. `apply::apply_plan`
+    /// re-verifies every one of these snapshots against fresh on-disk
+    /// state before touching anything, so `build` itself does not need to
+    /// be race-free — it's the plan's honest opinion of "now", checked
+    /// again at apply time.
+    pub fn build(root: &Path, form: PlanForm, reqs: &[resolve::EditRequest]) -> VcResult<Plan> {
+        let root_real = root
+            .canonicalize()
+            .map_err(|e| VcError::new(ErrorKind::Io, format!("{}: {e}", root.display())))?;
+        let edits = resolve::resolve_edits(&root_real, reqs)?;
+
+        let mut files = BTreeMap::new();
+        let mut realpaths = BTreeMap::new();
+        for edit in &edits {
+            if files.contains_key(&edit.path) {
+                continue;
+            }
+            let abs = root_real.join(&edit.path);
+            let file_hash = hash::file_hash(&abs)?;
+            let real = abs
+                .canonicalize()
+                .map_err(|e| VcError::new(ErrorKind::Io, format!("{}: {e}", abs.display())))?;
+            files.insert(edit.path.clone(), file_hash);
+            realpaths.insert(edit.path.clone(), real);
+        }
+
+        let (_ix, epoch) = index::refresh(&root_real)?;
+        let expected_count = edits.len();
+        let created_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        Ok(Plan {
+            version: 1,
+            form,
+            root_real,
+            epoch,
+            files,
+            realpaths,
+            edits,
+            expected_count,
+            created_unix,
+        })
+    }
+
     /// Canonical plan id: sha256 hex over the canonical JSON form of this
     /// struct. Field order is declaration order (stable); BTreeMaps give
     /// sorted keys; there are no floats anywhere in the struct — so this
@@ -199,5 +249,75 @@ mod tests {
     fn preview_shows_header_and_prefixed_old_new_lines() {
         let p = sample_plan();
         assert_eq!(p.preview(), "--- a.rs @ 0..3\n-one\n+two\n");
+    }
+
+    #[test]
+    fn build_populates_files_realpaths_epoch_and_expected_count() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().to_path_buf();
+        std::fs::create_dir_all(r.join(".vc")).unwrap();
+        std::fs::write(r.join("a.rs"), "fn one() {}\n").unwrap();
+
+        let reqs = vec![resolve::EditRequest {
+            path: "a.rs".into(),
+            old: b"one".to_vec(),
+            new: b"uno".to_vec(),
+            line_hint: None,
+        }];
+        let p = Plan::build(&r, PlanForm::Edit, &reqs).unwrap();
+
+        assert_eq!(p.expected_count, 1);
+        assert_eq!(p.edits.len(), 1);
+        assert_eq!(
+            p.files.get(&PathBuf::from("a.rs")),
+            Some(&crate::hash::bytes_hash(b"fn one() {}\n"))
+        );
+        assert_eq!(p.root_real, r.canonicalize().unwrap());
+        assert!(p.realpaths.contains_key(&PathBuf::from("a.rs")));
+        assert!(!p.epoch.is_empty());
+    }
+
+    #[test]
+    fn build_dedupes_a_file_touched_by_multiple_edits() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().to_path_buf();
+        std::fs::create_dir_all(r.join(".vc")).unwrap();
+        std::fs::write(r.join("a.rs"), "one two\n").unwrap();
+
+        let reqs = vec![
+            resolve::EditRequest {
+                path: "a.rs".into(),
+                old: b"one".to_vec(),
+                new: b"ONE".to_vec(),
+                line_hint: None,
+            },
+            resolve::EditRequest {
+                path: "a.rs".into(),
+                old: b"two".to_vec(),
+                new: b"TWO".to_vec(),
+                line_hint: None,
+            },
+        ];
+        let p = Plan::build(&r, PlanForm::Edit, &reqs).unwrap();
+
+        assert_eq!(p.edits.len(), 2);
+        assert_eq!(p.files.len(), 1, "one entry per touched file, not per edit");
+    }
+
+    #[test]
+    fn build_propagates_resolve_errors() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().to_path_buf();
+        std::fs::create_dir_all(r.join(".vc")).unwrap();
+        std::fs::write(r.join("a.rs"), "one\n").unwrap();
+
+        let reqs = vec![resolve::EditRequest {
+            path: "a.rs".into(),
+            old: b"missing".to_vec(),
+            new: b"x".to_vec(),
+            line_hint: None,
+        }];
+        let err = Plan::build(&r, PlanForm::Edit, &reqs).unwrap_err();
+        assert!(matches!(err.kind, crate::ErrorKind::NotFound));
     }
 }
