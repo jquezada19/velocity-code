@@ -10,6 +10,7 @@ pub mod index;
 pub mod journal;
 pub mod lock;
 pub mod plan;
+pub mod recover;
 pub mod resolve;
 pub mod root;
 pub mod walk;
