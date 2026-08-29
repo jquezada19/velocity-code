@@ -188,6 +188,33 @@ fn read_range_beyond_eof_clamps_to_true_end() {
     assert_eq!(v["text"], "2: two\n3: three");
 }
 
+/// A range whose START is beyond EOF is unsatisfiable, not clampable —
+/// `NotFound` (exit 1), not a silent empty "success" with an inverted
+/// start>end range (fix round 1, controller ruling).
+#[test]
+fn read_range_start_beyond_eof_is_not_found_not_silent_empty_success() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    let content = (1..=10).map(|i| format!("line {i}\n")).collect::<String>();
+    std::fs::write(r.join("file.txt"), content).unwrap();
+
+    let assert = vc(r)
+        .args(["read", "file.txt:11-12"])
+        .assert()
+        .failure()
+        .code(1);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("not-found:"), "got: {stderr}");
+    assert!(
+        stderr.contains("start beyond EOF (10 lines)"),
+        "got: {stderr}"
+    );
+    assert!(
+        stderr.contains("next: vc read file.txt:1-10"),
+        "got: {stderr}"
+    );
+}
+
 /// Over-budget content refuses via the new `Budget` kind — exit 1, `budget:`
 /// prefix, and a `vc outline <path>` next-hint — never a silent truncation.
 #[test]

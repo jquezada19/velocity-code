@@ -742,7 +742,22 @@ fn cmd_read_path(
     let content = std::fs::read_to_string(root.join(&rel))?;
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
+    let path_disp = rel.display().to_string();
     let (start, end) = match range {
+        // A start beyond EOF is unsatisfiable, not clampable — unlike `b`
+        // (agents overshoot the *end* of a range constantly, and clamping
+        // it to the true end is strictly more useful than refusing), a
+        // request that starts past the last line names no content at all.
+        // Silently returning an inverted start>end "success" with empty
+        // text would hide that from the caller; refuse instead (controller
+        // ruling, fix round 1).
+        Some((a, b)) if a > total => {
+            return Err(VcError::new(
+                ErrorKind::NotFound,
+                format!("{path_disp}:{a}-{b}: start beyond EOF ({total} lines)"),
+            )
+            .with_next(format!("vc read {path_disp}:1-{total}")));
+        }
         Some((a, b)) => (a, b.min(total)),
         None => (1, total),
     };
@@ -755,7 +770,6 @@ fn cmd_read_path(
         text.push_str(&format!("{i}: {}", lines[i - 1]));
     }
 
-    let path_disp = rel.display().to_string();
     cmd_read_budget_check(&path_disp, &text, budget)?;
 
     let mut human = format!("epoch {epoch8} — {path_disp}:{start}-{end}\n");
