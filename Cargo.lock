@@ -1028,6 +1028,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "velocity-code-query"
+version = "0.0.1"
+dependencies = [
+ "memchr",
+ "tempfile",
+ "velocity-code-kernel",
+]
+
+[[package]]
 name = "velocity-code-select"
 version = "0.0.1"
 dependencies = [

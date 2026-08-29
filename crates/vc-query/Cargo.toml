@@ -1,0 +1,13 @@
+[package]
+name = "velocity-code-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+memchr.workspace = true
+velocity-code-kernel = { path = "../vc-kernel" }
+
+[dev-dependencies]
+tempfile.workspace = true
