@@ -1,0 +1,225 @@
+//! Certificate check at apply — scope-drift refusal (exit 4). Task 14, the
+//! spec's flagship safety scenario: "a 24th site appeared in a file you
+//! didn't plan." A match-form plan's `ProvenanceCert` records every file
+//! its selector could see at plan time; before `vc apply` ever reaches the
+//! kernel, the CLI re-derives the selector's CURRENT visible scope
+//! (identical `walk_scoped(selector.paths) ∩ lang_tag == selector.lang`
+//! definition) and refuses if a file OUTSIDE the plan's named set now
+//! matches the selector — a change the plan never accounted for and never
+//! asked the caller to review.
+
+use assert_cmd::Command;
+
+fn vc(dir: &std::path::Path) -> Command {
+    let mut c = Command::cargo_bin("vc").unwrap();
+    c.current_dir(dir);
+    c
+}
+
+fn plan_match(r: &std::path::Path, pattern: &str, rewrite: &str) -> (String, serde_json::Value) {
+    let out = vc(r)
+        .args([
+            "--json",
+            "plan",
+            "match",
+            "--pattern",
+            pattern,
+            "--rewrite",
+            rewrite,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let sha8 = v["sha8"].as_str().unwrap().to_string();
+    (sha8, v)
+}
+
+/// The canonical scenario: a plan matches only `a.rs`. `b.rs` is later
+/// mutated so the SAME pattern now matches there too — a site the plan
+/// never named and never asked the caller to review. `apply` must refuse
+/// (`ScopeDrift`, exit 4) rather than silently applying only what it
+/// planned while a real, live match sits untouched outside the named set.
+#[test]
+fn a_new_match_outside_the_named_set_refuses_scope_drift_exit_4() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
+    std::fs::write(r.join("b.rs"), "fn other() {}\n").unwrap();
+
+    let (sha8, v) = plan_match(r, "fetch_config($$$A)", "load_config($$$A)");
+    assert_eq!(v["sites"], 1);
+    assert_eq!(v["files"], 1);
+
+    let a_before = std::fs::read(r.join("a.rs")).unwrap();
+
+    // b.rs gains a match after the plan was built — the "24th site".
+    std::fs::write(r.join("b.rs"), "fn other() { fetch_config(x); }\n").unwrap();
+
+    let assert = vc(r).args(["apply", &sha8]).assert().failure().code(4);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("scope-drift: b.rs"), "stderr: {stderr}");
+    assert!(stderr.contains("next: vc plan refresh"), "stderr: {stderr}");
+
+    let a_after = std::fs::read(r.join("a.rs")).unwrap();
+    assert_eq!(a_before, a_after, "kernel apply must never have run");
+}
+
+/// The false-refusal half of the gate: drift is NOT "any change outside
+/// the named set" — a change to `b.rs` that does not create a new match
+/// must let `apply` proceed normally.
+#[test]
+fn unrelated_change_outside_named_set_does_not_refuse() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
+    std::fs::write(r.join("b.rs"), "fn other() {}\n").unwrap();
+
+    let (sha8, _v) = plan_match(r, "fetch_config($$$A)", "load_config($$$A)");
+
+    // b.rs changes, but never gains a fetch_config(...) call.
+    std::fs::write(r.join("b.rs"), "fn other() { println!(\"hi\"); }\n").unwrap();
+
+    vc(r).args(["apply", &sha8]).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(r.join("a.rs")).unwrap(),
+        "fn main() { load_config(a); }\n"
+    );
+}
+
+/// A change to a NAMED file (in the plan's own `files` set) is the
+/// kernel's existing stale check (exit 3), not scope drift (exit 4) — the
+/// drift check is exclusively about files OUTSIDE the plan.
+#[test]
+fn change_to_a_named_file_is_stale_not_drift() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
+
+    let (sha8, _v) = plan_match(r, "fetch_config($$$A)", "load_config($$$A)");
+
+    // a.rs (the NAMED file) changes after planning.
+    std::fs::write(
+        r.join("a.rs"),
+        "fn main() { fetch_config(a); }\n// drifted\n",
+    )
+    .unwrap();
+
+    let assert = vc(r).args(["apply", &sha8]).assert().failure().code(3);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.starts_with("stale:"), "stderr: {stderr}");
+}
+
+/// A file that did NOT EXIST at plan time — absent from the certificate's
+/// `scope_files` entirely — must be treated exactly like a changed file:
+/// if it now matches the selector, that's drift.
+#[test]
+fn new_file_that_matches_is_drift() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
+
+    let (sha8, _v) = plan_match(r, "fetch_config($$$A)", "load_config($$$A)");
+
+    // A brand new file appears, matching the selector.
+    std::fs::write(r.join("c.rs"), "fn c() { fetch_config(z); }\n").unwrap();
+
+    let assert = vc(r).args(["apply", &sha8]).assert().failure().code(4);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("scope-drift: c.rs"), "stderr: {stderr}");
+}
+
+/// A candidate file that fails to parse at drift-check time cannot be
+/// cleared by the selector at all (its match-or-not status is genuinely
+/// unknown) — conservatively treated as drift too, rather than silently
+/// let through because the matcher merely warned instead of hard-failing.
+#[test]
+fn candidate_file_that_fails_to_parse_is_drift() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
+    std::fs::write(r.join("b.rs"), "fn other() {}\n").unwrap();
+
+    let (sha8, _v) = plan_match(r, "fetch_config($$$A)", "load_config($$$A)");
+
+    // b.rs changes into something that no longer parses as rust.
+    std::fs::write(r.join("b.rs"), "fn broken( { fetch_config(a) ]]]\n").unwrap();
+
+    let assert = vc(r).args(["apply", &sha8]).assert().failure().code(4);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("scope-drift:"), "stderr: {stderr}");
+    assert!(stderr.contains("b.rs"), "stderr: {stderr}");
+}
+
+/// End-to-end recovery path: after a scope-drift refusal, `vc plan
+/// refresh` re-runs the full selector pipeline against the CURRENT tree,
+/// and the refreshed plan applies cleanly — the caller's actual way out.
+#[test]
+fn after_refresh_the_refreshed_plan_applies_cleanly() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
+    std::fs::write(r.join("b.rs"), "fn other() {}\n").unwrap();
+
+    let (sha8, _v) = plan_match(r, "fetch_config($$$A)", "load_config($$$A)");
+
+    std::fs::write(r.join("b.rs"), "fn other() { fetch_config(x); }\n").unwrap();
+
+    vc(r).args(["apply", &sha8]).assert().failure().code(4);
+
+    let out = vc(r)
+        .args(["--json", "plan", "refresh", &sha8])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let sha8b = v["sha8"].as_str().unwrap().to_string();
+    assert_eq!(v["sites"], 2, "refresh must see both a.rs and b.rs now");
+
+    vc(r).args(["apply", &sha8b]).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(r.join("a.rs")).unwrap(),
+        "fn main() { load_config(a); }\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(r.join("b.rs")).unwrap(),
+        "fn other() { load_config(x); }\n"
+    );
+}
+
+/// Edit-form plans carry no `certificate`/`selector` — the drift check
+/// must be a no-op for them, not error out on `None.unwrap()` or similar.
+#[test]
+fn edit_form_plan_skips_the_drift_check_entirely() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn old_name() {}\n").unwrap();
+
+    let out = vc(r)
+        .args([
+            "--json", "plan", "edit", "a.rs", "--old", "old_name", "--new", "new_name",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let sha8 = serde_json::from_slice::<serde_json::Value>(&out).unwrap()["sha8"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Unrelated new file appears — must not trip any drift logic for a
+    // plan with no selector/certificate to check against.
+    std::fs::write(r.join("b.rs"), "fn other() {}\n").unwrap();
+
+    vc(r).args(["apply", &sha8]).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(r.join("a.rs")).unwrap(),
+        "fn new_name() {}\n"
+    );
+}

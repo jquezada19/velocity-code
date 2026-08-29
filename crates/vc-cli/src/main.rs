@@ -19,7 +19,7 @@ use velocity_code_kernel::{
     plan::{MatchSelector, Plan, PlanForm, ResolvedEdit, b64d, b64e},
     recover::{self, DoctorAction},
     resolve::EditRequest,
-    {apply, index, root, walk},
+    {apply, hash, index, root, walk},
 };
 use velocity_code_select::{edits_from_args, edits_from_diff, match_sites};
 
@@ -509,7 +509,100 @@ fn cmd_show(root: &Path, sha8: &str) -> VcResult<CmdOutcome> {
     })
 }
 
+/// Certificate check at apply (Task 14) — the spec's flagship safety
+/// scenario: "a 24th site appeared in a file you didn't plan." Runs
+/// BEFORE `apply::apply_plan` ever reaches the kernel. A match-form
+/// plan's `ProvenanceCert` (`plan.certificate`) records every file its
+/// selector could see at plan time (`walk_scoped(selector.paths) ∩
+/// lang_tag == selector.lang`, hashed); this re-derives that IDENTICAL
+/// candidate set against the CURRENT tree and refuses (`ScopeDrift`, exit
+/// 4) if a file OUTSIDE the plan's named set (`plan.files`) now matches
+/// the selector's pattern.
+///
+/// Named-set changes are deliberately NOT this check's concern — a
+/// changed NAMED file is the kernel's own stale check (exit 3), which
+/// `apply::apply_plan` still runs unconditionally after this returns
+/// `Ok(())`. This function only ever refuses; it never authorizes
+/// anything the kernel wouldn't already allow (D10), and — since it
+/// returns before `apply::apply_plan` is ever called — a refusal here
+/// leaves the tree completely untouched.
+///
+/// An edit/import plan (`certificate: None`) skips this entirely: there
+/// is no selector to have drifted.
+fn check_scope_drift(root: &Path, sha8: &str) -> VcResult<()> {
+    let plan = Plan::load(root, sha8)?;
+    let (Some(cert), Some(sel)) = (&plan.certificate, &plan.selector) else {
+        return Ok(());
+    };
+
+    // Same walk-then-lang-filter definition `ProvenanceCert::scope_files`
+    // was built from (`Plan::build_match`) — the cert's doc comment pins
+    // this as binding: both sides must use the identical filter or the
+    // comparison below is meaningless.
+    let walked = walk::walk_scoped(root, &sel.paths)?;
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    for rel in walked {
+        if lang_tag(&rel) != sel.lang {
+            continue;
+        }
+        if plan.files.contains_key(&rel) {
+            // Named-set changes stay the kernel's stale check (exit 3) —
+            // drift is exclusively about files OUTSIDE the plan.
+            continue;
+        }
+        let current_hash = match hash::file_hash(&root.join(&rel)) {
+            Ok(h) => h,
+            // Unreadable right now (e.g. removed mid-race) — not a live
+            // match either way; the kernel's own checks handle a
+            // genuinely missing file if it matters to this plan.
+            Err(_) => continue,
+        };
+        let drifted = match cert.scope_files.get(&rel) {
+            Some(old_hash) => *old_hash != current_hash,
+            None => true, // new file — absent from the certificate entirely
+        };
+        if drifted {
+            candidates.push(rel);
+        }
+    }
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let (sites, _content_by_path, warnings) =
+        match_sites(root, &sel.pattern, &sel.rewrite, &sel.lang, &candidates)?;
+
+    // A live match in a drifted, out-of-plan file: the canonical "24th
+    // site" refusal.
+    if let Some(first) = sites.first() {
+        let path = first.path.display().to_string();
+        let n = sites.len();
+        return Err(VcError::new(
+            ErrorKind::ScopeDrift,
+            format!("{path} gained a match since plan ({n} new site(s))"),
+        )
+        .with_next(format!("vc plan refresh {sha8}")));
+    }
+
+    // A drifted candidate that `match_sites` could not even parse (or
+    // read as valid UTF-8): its match-or-not status is genuinely unknown,
+    // and an unknown candidate cannot be cleared by the selector — treat
+    // it as drift too (conservative: a file you can't check is a file
+    // you can't clear).
+    if let Some(w) = warnings.first() {
+        return Err(VcError::new(
+            ErrorKind::ScopeDrift,
+            format!("{w} — could not be verified against the selector since plan"),
+        )
+        .with_next(format!("vc plan refresh {sha8}")));
+    }
+
+    Ok(())
+}
+
 fn cmd_apply(root: &Path, sha8: &str) -> VcResult<CmdOutcome> {
+    check_scope_drift(root, sha8)?;
     let report = apply::apply_plan(root, sha8)?;
     let epoch8 = index::epoch8(&report.epoch_after).to_string();
     let human = format!(
