@@ -41,14 +41,19 @@ to the drift:
   without writing anything.
 
 Why an append, specifically: an earlier draft of this script had the
-drift *replace* the needle (`let v = 1` → some other text), which made
-the *baseline's* replace a no-op too — both arms would "fail safe" for
-unrelated reasons (the baseline harmlessly finds nothing to replace, not
-because it detected staleness), and the demonstration would prove
-nothing. An append-only drift keeps the naive tool's failure mode real:
-the text it's matching against is still there, so its replace still
-fires, on stale content, same as a naive string-replace agent would do
-against a file another process just touched.
+drift *replace* the needle (`let v = 1` → `let v = 10`). Whether the
+*baseline's* replace then fires or silently no-ops turns out to hinge on
+a numeric coincidence, not on anything the harness means to test:
+`"let v = 1"` is a literal prefix of `"let v = 10"`, so the replace still
+fires — just mangled, into `let v = 20` — while a drifted value like `99`
+shares no such prefix and would genuinely no-op. Either way, the
+demonstration's outcome would be at the mercy of which numbers happened
+to be picked, not a property of the mechanism under test. An append-only
+drift removes that coincidence entirely: the needle survives
+*unconditionally*, so detection can only happen by noticing the file as a
+whole changed (a content hash) — the same property `vc`'s staleness check
+relies on, and the only honest way to provoke the naive tool's real
+failure mode.
 
 ## The gate
 

@@ -7,8 +7,12 @@
 # README.md) — two scripted arms, no agent in the loop.
 #
 # Drift design (controller ruling R3 — the M1 pre-flight conflict scan
-# flagged the original draft's drift as REPLACING the needle, which made
-# the baseline silently no-op instead of demonstrating a stale write):
+# flagged the original draft's drift as REPLACING the needle: whether
+# that baseline's replace then fires or no-ops turns out to hinge on
+# numeric coincidence between the old/new values (1->10 still fires,
+# since "let v = 1" is a literal prefix of "let v = 10"; 1->99 would
+# genuinely no-op) — not on the mechanism under test, which is the wrong
+# thing for a benchmark to rest on. An append can't have that coincidence:
 # the injected drift APPENDS a marker line. The file changes, but the
 # needle (`let v = 1`) the edit is looking for SURVIVES the drift. Both
 # arms therefore attempt the exact same still-matching edit against
