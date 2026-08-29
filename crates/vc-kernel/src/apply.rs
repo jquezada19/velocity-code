@@ -182,23 +182,61 @@ pub fn undo(root: &Path, id: Option<&str>) -> VcResult<ApplyReport> {
     })
 }
 
-/// Single-read hash-gate for `undo`: for every file in `entry`, read its
-/// current bytes exactly once and require their hash equals the journal
-/// entry's recorded `post_hash` (i.e. nothing has touched the file since
-/// the apply/undo being reversed) — a missing file or a read error also
-/// counts as changed. Mismatches are collected across every file before
-/// refusing once (`Stale`), mirroring `verify_files`. On success, returns
-/// the bytes just read, keyed by path, so the caller never has to read
-/// the files a second time.
+/// Single-read hash-gate for `undo`, mirroring `verify_files`'s
+/// preconditions (kernel change driven by Task 12's TOCTOU property suite —
+/// see `toctou.rs`'s `undo_target_replaced_by_symlink_is_refused`): for
+/// every file in `entry`, first (a) refuse to follow a symlink at the
+/// tracked path — not even to hash it — and (b) refuse if its parent no
+/// longer canonicalizes inside `root` (both `Toctou`, refused immediately,
+/// *before* any read — a hash comparison alone can't catch a symlink whose
+/// target happens to hold matching bytes). Only then (c) read its current
+/// bytes exactly once and require their hash equals the journal entry's
+/// recorded `post_hash` (i.e. nothing has touched the file since the
+/// apply/undo being reversed) — a missing file, a read error, or a hash
+/// mismatch all count as changed. Staleness from (c) is collected across
+/// every file before refusing once (`Stale`), mirroring `verify_files`. On
+/// success, returns the bytes just read, keyed by path, so the caller
+/// never has to read the files a second time.
 fn verify_current_matches_post(
     root: &Path,
     entry: &journal::JournalEntry,
 ) -> VcResult<BTreeMap<PathBuf, Vec<u8>>> {
+    let root_real = root
+        .canonicalize()
+        .map_err(|e| VcError::new(ErrorKind::Io, format!("{}: {e}", root.display())))?;
+
     let mut stale: Vec<PathBuf> = Vec::new();
     let mut current: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
 
     for fi in &entry.files {
         let abs = root.join(&fi.path);
+
+        let md = match std::fs::symlink_metadata(&abs) {
+            Ok(md) => md,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                stale.push(fi.path.clone());
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if md.file_type().is_symlink() {
+            return Err(VcError::new(
+                ErrorKind::Toctou,
+                format!("{}: refusing to follow symlink", fi.path.display()),
+            ));
+        }
+
+        let parent = abs.parent().unwrap_or(root);
+        let real_parent = parent
+            .canonicalize()
+            .map_err(|e| VcError::new(ErrorKind::Toctou, format!("{}: {e}", fi.path.display())))?;
+        if !real_parent.starts_with(&root_real) {
+            return Err(VcError::new(
+                ErrorKind::Toctou,
+                format!("{}: parent directory escaped the root", fi.path.display()),
+            ));
+        }
+
         let bytes = match std::fs::read(&abs) {
             Ok(bytes) => bytes,
             Err(_) => {
