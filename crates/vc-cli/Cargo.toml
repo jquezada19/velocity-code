@@ -22,3 +22,18 @@ velocity-code-select = { path = "../vc-select" }
 [dev-dependencies]
 tempfile.workspace = true
 assert_cmd.workspace = true
+
+# Gated separately from the auto-discovered `tests/*.rs` targets: this
+# suite spawns the real `vc` binary and relies on VC_FAULT_POINT actually
+# firing (exit 86), which only happens when the kernel's
+# `fault-injection` feature is compiled in. Without `required-features`,
+# a plain `cargo test --workspace` (no extra features — the base CI line)
+# would still discover and run this target, and every kill-point
+# assertion would fail because the fault point never fires.
+# `required-features` makes Cargo skip building/running it entirely
+# unless the feature is explicitly requested (Task 13's own CI line
+# does).
+[[test]]
+name = "crash_consistency"
+path = "tests/crash_consistency.rs"
+required-features = ["fault-injection"]
