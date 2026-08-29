@@ -1,0 +1,72 @@
+DEFAULT_BUDGET	const	plan.rs:7
+PLAN_VERSION	static	plan.rs:9
+PlanId	typealias	plan.rs:11
+Plan	struct	plan.rs:14
+Site	struct	plan.rs:21
+PlanKind	enum	plan.rs:27
+new	method	plan.rs:34
+id	method	plan.rs:42
+add_site	method	plan.rs:46
+fmt	method	plan.rs:52
+Summarize	trait	plan.rs:57
+summary	function	plan.rs:58
+short_summary	function	plan.rs:60
+fmt::Display for Plan	impl	plan.rs:51
+Summarize for Plan	impl	plan.rs:65
+merge_plans	function	plan.rs:71
+largest_site	function	plan.rs:75
+budget	module	plan.rs:79
+MAX_TOKENS	const	plan.rs:80
+within	function	plan.rs:82
+BINARY_SNIFF_LEN	const	query.rs:7
+WARN_PREFIX	static	query.rs:9
+Score	typealias	query.rs:11
+QueryHit	struct	query.rs:14
+SymbolHit	struct	query.rs:21
+HitKind	enum	query.rs:27
+Rankable	trait	query.rs:33
+rank	function	query.rs:34
+Rankable for QueryHit	impl	query.rs:37
+Rankable for SymbolHit	impl	query.rs:43
+describe	method	query.rs:58
+sort_by_rank	function	query.rs:69
+top_hit	function	query.rs:75
+render	module	query.rs:81
+MAX_LINE_WIDTH	const	query.rs:82
+truncate	function	query.rs:84
+PI	const	shapes.rs:7
+Length	typealias	shapes.rs:9
+Circle	struct	shapes.rs:12
+Square	struct	shapes.rs:17
+Orientation	enum	shapes.rs:22
+Area	trait	shapes.rs:28
+area	function	shapes.rs:29
+describe_area	function	shapes.rs:31
+Area for Circle	impl	shapes.rs:36
+Area for Square	impl	shapes.rs:42
+scale	method	shapes.rs:53
+fmt::Display for Circle	impl	shapes.rs:72
+largest_area	function	shapes.rs:78
+units	module	shapes.rs:84
+CM_PER_INCH	const	shapes.rs:87
+to_cm	function	shapes.rs:89
+CACHE_CAPACITY	const	util.rs:21
+EMPTY_LABEL	static	util.rs:23
+CacheKey	typealias	util.rs:25
+Cache	struct	util.rs:28
+Cache<V>	impl	util.rs:32
+get	method	util.rs:39
+insert	method	util.rs:43
+Evictable	trait	util.rs:48
+should_evict	function	util.rs:49
+EvictionPolicy	enum	util.rs:52
+Evictable for EvictionPolicy	impl	util.rs:58
+clamp_capacity	function	util.rs:68
+Widget	struct	util.rs:80
+helpers	module	util.rs:93
+identity	function	util.rs:94
+PhantomHelper	NONE
+ghost_fn	NONE
+LEGACY_TOKEN	NONE
+retired_widget	NONE
+NotARealTrait	NONE

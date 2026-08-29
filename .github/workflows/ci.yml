@@ -17,3 +17,5 @@ jobs:
       - run: cargo build --release
       - name: R1 lexical parity
         run: PATH="$PWD/target/release:$PATH" harness/r/r1_lexical.sh
+      - name: R1 definitions (Rust)
+        run: PATH="$PWD/target/release:$PATH" harness/r/r1_defs.sh
