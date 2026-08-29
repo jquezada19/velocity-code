@@ -138,9 +138,24 @@ fn rebase_user_path(root: &Path, cwd: &Path, user_path: &Path) -> VcResult<std::
     } else {
         cwd.join(user_path)
     };
-    let abs_real = abs
-        .canonicalize()
-        .map_err(|e| VcError::new(ErrorKind::Io, format!("{}: {e}", abs.display())))?;
+    // The user's own (relative-as-typed) path names the message here, not
+    // `abs` — `abs` is `cwd`-joined and tempdir-prefixed in tests, and
+    // leaking that absolute path is both noisy and inconsistent with every
+    // other kernel path that reports a missing file (`resolve_edits`'s
+    // "{path}: no such file", relative). A `NotFound` canonicalize failure
+    // (by far the common case — the file just doesn't exist) is remapped
+    // to the same `ErrorKind::NotFound` + message shape the kernel already
+    // uses; any other OS error keeps `Io` but still names the user's path.
+    let abs_real = abs.canonicalize().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            VcError::new(
+                ErrorKind::NotFound,
+                format!("{}: no such file", user_path.display()),
+            )
+        } else {
+            VcError::new(ErrorKind::Io, format!("{}: {e}", user_path.display()))
+        }
+    })?;
     abs_real
         .strip_prefix(&root_real)
         .map(|p| p.to_path_buf())

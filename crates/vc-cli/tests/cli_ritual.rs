@@ -415,6 +415,46 @@ fn plan_edit_absolute_path_outside_root_is_usage_error() {
     );
 }
 
+/// C2 residual regression: `rebase_user_path`'s `abs.canonicalize()` on a
+/// missing file must report `not-found` with the user's ORIGINAL
+/// (relative) path, matching every other kernel path that reports a
+/// missing file — not `io` with the absolute, tempdir-prefixed path
+/// leaked into the message.
+#[test]
+fn plan_edit_missing_file_is_not_found_with_users_relative_path() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+
+    let out = vc(r)
+        .args([
+            "--json",
+            "plan",
+            "edit",
+            "ghost.txt",
+            "--old",
+            "x",
+            "--new",
+            "y",
+        ])
+        .assert()
+        .failure()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["error"]["kind"].as_str().unwrap(), "not-found");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("ghost.txt"),
+        "message must name the user's path: {message}"
+    );
+    assert!(
+        !message.contains(&r.display().to_string()),
+        "message must not leak the absolute tempdir-prefixed path: {message}"
+    );
+}
+
 /// Own test: `gain` on a repo with no `.vc/metrics/` at all (nothing has
 /// ever run) succeeds with an empty aggregate rather than erroring.
 #[test]
