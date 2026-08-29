@@ -1029,6 +1029,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "velocity-code-lang"
+version = "0.0.1"
+dependencies = [
+ "tree-sitter",
+ "tree-sitter-rust",
+ "velocity-code-kernel",
+]
+
+[[package]]
 name = "velocity-code-query"
 version = "0.0.1"
 dependencies = [
