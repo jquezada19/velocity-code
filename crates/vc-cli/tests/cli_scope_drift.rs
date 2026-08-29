@@ -191,6 +191,97 @@ fn after_refresh_the_refreshed_plan_applies_cleanly() {
     );
 }
 
+/// Fix round 1 (review finding, Important): a selector-visible, out-of-plan
+/// file that becomes UNREADABLE (permissions flipped, not deleted) must
+/// fail CLOSED — refuse `ScopeDrift` naming it — rather than being
+/// silently skipped. A file outside `plan.files` is invisible to the
+/// kernel's own stale check, so this drift check is the ONE place that can
+/// catch it; treating "can't read it" the same as "definitely unchanged"
+/// would leave exactly the gap the check exists to close.
+#[cfg(unix)]
+#[test]
+fn unreadable_candidate_fails_closed_scope_drift_exit_4() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
+    std::fs::write(r.join("b.rs"), "fn other() {}\n").unwrap();
+
+    let (sha8, _v) = plan_match(r, "fetch_config($$$A)", "load_config($$$A)");
+
+    let b_path = r.join("b.rs");
+    std::fs::set_permissions(&b_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = vc(r).args(["apply", &sha8]).output().unwrap();
+
+    // Restore permissions before any assertion below can panic, so the
+    // tempdir's own Drop cleanup is never at the mercy of a failed test.
+    std::fs::set_permissions(&b_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("scope-drift:"), "stderr: {stderr}");
+    assert!(stderr.contains("b.rs"), "stderr: {stderr}");
+}
+
+/// The benign sub-case, pinned alongside the fail-closed case above so the
+/// two don't get confused: a candidate file DELETED since plan time (a
+/// `NotFound` read, not any other I/O error) cannot contain a new match —
+/// it's simply out of scope now — so `apply` must still succeed as long as
+/// nothing else drifted.
+#[test]
+fn deleted_candidate_is_benign_apply_still_succeeds() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
+    std::fs::write(r.join("b.rs"), "fn other() {}\n").unwrap();
+
+    let (sha8, _v) = plan_match(r, "fetch_config($$$A)", "load_config($$$A)");
+
+    // b.rs (in scope, unnamed, no match at plan time) is removed entirely.
+    std::fs::remove_file(r.join("b.rs")).unwrap();
+
+    vc(r).args(["apply", &sha8]).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(r.join("a.rs")).unwrap(),
+        "fn main() { load_config(a); }\n"
+    );
+}
+
+/// Fix round 1 (folded minor): when MORE THAN ONE out-of-plan file drifted
+/// into a live match, the refusal names the first drifted path and counts
+/// ONLY that file's own sites — not the total across every drifted file
+/// (the bug: `b.rs`'s message previously reported `c.rs`'s sites too) —
+/// and separately notes how many OTHER files also drifted.
+#[test]
+fn multi_file_drift_attributes_site_count_per_file() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
+    std::fs::write(r.join("b.rs"), "fn other() {}\n").unwrap();
+    std::fs::write(r.join("c.rs"), "fn third() {}\n").unwrap();
+
+    let (sha8, _v) = plan_match(r, "fetch_config($$$A)", "load_config($$$A)");
+
+    // b.rs gains exactly ONE new site; c.rs gains TWO.
+    std::fs::write(r.join("b.rs"), "fn other() { fetch_config(x); }\n").unwrap();
+    std::fs::write(
+        r.join("c.rs"),
+        "fn third() { fetch_config(y); fetch_config(z); }\n",
+    )
+    .unwrap();
+
+    let assert = vc(r).args(["apply", &sha8]).assert().failure().code(4);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    // b.rs sorts before c.rs, so it's the named file — its own count (1),
+    // never c.rs's (2) folded in, plus a note that one other file drifted.
+    assert!(
+        stderr.contains("b.rs gained a match since plan (1 new site(s)) (+1 more file(s))"),
+        "stderr: {stderr}"
+    );
+}
+
 /// Edit-form plans carry no `certificate`/`selector` — the drift check
 /// must be a no-op for them, not error out on `None.unwrap()` or similar.
 #[test]

@@ -550,13 +550,38 @@ fn check_scope_drift(root: &Path, sha8: &str) -> VcResult<()> {
             // drift is exclusively about files OUTSIDE the plan.
             continue;
         }
-        let current_hash = match hash::file_hash(&root.join(&rel)) {
-            Ok(h) => h,
-            // Unreadable right now (e.g. removed mid-race) — not a live
-            // match either way; the kernel's own checks handle a
-            // genuinely missing file if it matters to this plan.
-            Err(_) => continue,
+        // Read directly (rather than through `hash::file_hash`) so a read
+        // failure's `io::ErrorKind` survives to distinguish the two cases
+        // below — `hash::file_hash`'s `?` collapses every I/O error into
+        // `ErrorKind::Io` with just the `Display` string, which loses
+        // exactly the distinction this needs.
+        let bytes = match std::fs::read(root.join(&rel)) {
+            Ok(b) => b,
+            // Deleted since plan time: benign — a file that no longer
+            // exists cannot contain a new match, so it's simply out of
+            // scope now, same as if it had never been in scope.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // Any OTHER read failure (permissions flipped, transient EIO,
+            // ...) is the fail-OPEN gap review round 1 caught: a file
+            // outside `plan.files` is invisible to the kernel's own stale
+            // check, so silently skipping it here — the one place this
+            // check is the sole guard — would let a file whose current
+            // content (and thus match status) is genuinely unknown slip
+            // straight through to apply. Refuse instead, same
+            // conservative posture as an unparseable candidate below: a
+            // file you can't read is a file you can't clear.
+            Err(e) => {
+                return Err(VcError::new(
+                    ErrorKind::ScopeDrift,
+                    format!(
+                        "{}: {e} — could not be verified against the selector since plan",
+                        rel.display()
+                    ),
+                )
+                .with_next(format!("vc plan refresh {sha8}")));
+            }
         };
+        let current_hash = hash::bytes_hash(&bytes);
         let drifted = match cert.scope_files.get(&rel) {
             Some(old_hash) => *old_hash != current_hash,
             None => true, // new file — absent from the certificate entirely
@@ -574,15 +599,27 @@ fn check_scope_drift(root: &Path, sha8: &str) -> VcResult<()> {
         match_sites(root, &sel.pattern, &sel.rewrite, &sel.lang, &candidates)?;
 
     // A live match in a drifted, out-of-plan file: the canonical "24th
-    // site" refusal.
+    // site" refusal. Attribution stays per-file (fix round 1): `n` names
+    // ONLY the first drifted path's own site count, not the total across
+    // every drifted file, which previously misattributed sites in a
+    // SECOND drifted file to the one named in the message. When more than
+    // one file drifted, that fact is still surfaced — via a trailing
+    // `(+k more file(s))` — without folding their counts into `n`.
     if let Some(first) = sites.first() {
+        let mut sites_by_file: std::collections::BTreeMap<&std::path::Path, usize> =
+            std::collections::BTreeMap::new();
+        for s in &sites {
+            *sites_by_file.entry(s.path.as_path()).or_insert(0) += 1;
+        }
         let path = first.path.display().to_string();
-        let n = sites.len();
-        return Err(VcError::new(
-            ErrorKind::ScopeDrift,
-            format!("{path} gained a match since plan ({n} new site(s))"),
-        )
-        .with_next(format!("vc plan refresh {sha8}")));
+        let n = sites_by_file[first.path.as_path()];
+        let other_files = sites_by_file.len() - 1;
+        let mut message = format!("{path} gained a match since plan ({n} new site(s))");
+        if other_files > 0 {
+            message.push_str(&format!(" (+{other_files} more file(s))"));
+        }
+        return Err(VcError::new(ErrorKind::ScopeDrift, message)
+            .with_next(format!("vc plan refresh {sha8}")));
     }
 
     // A drifted candidate that `match_sites` could not even parse (or
