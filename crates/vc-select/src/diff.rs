@@ -119,6 +119,17 @@ pub fn edits_from_diff(diff_text: &str) -> Result<Vec<EditRequest>, VcError> {
             if old.is_empty() && new.is_empty() {
                 return Err(mal("empty hunk"));
             }
+            if old.is_empty() {
+                // old_len == 0: a pure insertion / new-file hunk. There is
+                // no anchor text for `resolve_edits`' exact-match search
+                // to find, so this must refuse honestly here rather than
+                // surface as a confusing NotFound/Ambiguous once an empty
+                // `old` reaches resolution (an empty needle "matches"
+                // everywhere).
+                return Err(mal(
+                    "insertion-only hunks unsupported in M1 — no anchor text",
+                ));
+            }
             out.push(EditRequest {
                 path,
                 old,
@@ -293,6 +304,28 @@ this line is not a header or furniture
 ";
         let e = edits_from_diff(diff).unwrap_err();
         assert!(matches!(e.kind, velocity_code_kernel::ErrorKind::Malformed));
+    }
+
+    /// J: a hunk whose old side is empty — `@@ -1,0 +1,N @@`, a pure
+    /// insertion with no anchor text on the old side — must be refused
+    /// honestly (`Malformed`, naming the reason) rather than falling
+    /// through to whatever `resolve_edits` would make of an empty `old`
+    /// (an empty needle matches everywhere, which is a `NotFound`/
+    /// `Ambiguous` failure far from the real cause).
+    #[test]
+    fn insertion_only_hunk_is_refused_not_deferred_to_a_later_notfound() {
+        let diff = "\
+--- a/x.txt
++++ b/x.txt
+@@ -1,0 +1,1 @@
++brand new line
+";
+        let e = edits_from_diff(diff).unwrap_err();
+        assert!(matches!(e.kind, velocity_code_kernel::ErrorKind::Malformed));
+        assert_eq!(
+            e.message,
+            "diff: insertion-only hunks unsupported in M1 — no anchor text"
+        );
     }
 
     /// Missing `,len` on a header side defaults to 1, per unified-diff
