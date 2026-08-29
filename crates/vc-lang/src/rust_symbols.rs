@@ -15,23 +15,28 @@ pub(crate) fn extract(src: &str) -> VcResult<Vec<Symbol>> {
 
     let tree = parser
         .parse(src, None)
-        .ok_or_else(|| VcError::new(ErrorKind::Malformed, "rust: source failed to parse"))?;
+        .ok_or_else(|| VcError::new(ErrorKind::Malformed, "rust: source did not parse"))?;
 
     let root = tree.root_node();
-    // tree-sitter is error-tolerant: a syntax error inside the file shows up
-    // as a localized ERROR node under `source_file`, and we still walk past
-    // it. The root itself only comes back as ERROR when nothing recognizable
-    // as Rust could be matched at all — that's a whole-file parse failure.
-    if root.kind() == "ERROR" {
-        return Err(VcError::new(
-            ErrorKind::Malformed,
-            "rust: source failed to parse",
-        ));
-    }
-
     let bytes = src.as_bytes();
     let mut out = Vec::new();
     walk(root, bytes, false, &mut out);
+
+    // tree-sitter is error-tolerant and its root node is always
+    // `source_file`, never `ERROR`, even for garbage input (verified against
+    // nine garbage inputs: empty, binary, NUL bytes, lone tokens, prose —
+    // none produced an ERROR-kind root). So "the whole file failed to parse"
+    // has to be read off the walk's actual result instead of the root node's
+    // kind: the tree recorded an error, extraction found nothing usable, and
+    // the input wasn't merely blank (a blank file legitimately has zero
+    // symbols and no error).
+    if root.has_error() && out.is_empty() && !src.trim().is_empty() {
+        return Err(VcError::new(
+            ErrorKind::Malformed,
+            "rust: source did not parse",
+        ));
+    }
+
     Ok(out)
 }
 
@@ -61,7 +66,11 @@ fn walk(node: Node, src: &[u8], in_impl: bool, out: &mut Vec<Symbol>) {
 
 fn symbol_kind(node_kind: &str, in_impl: bool) -> Option<SymbolKind> {
     Some(match node_kind {
-        "function_item" => {
+        // `function_signature_item` is a bodyless trait method declaration
+        // (`fn foo(&self);`) — a distinct node kind from `function_item`
+        // (which covers both free functions and default-bodied trait/impl
+        // methods). Same ancestry-based kind logic applies to both.
+        "function_item" | "function_signature_item" => {
             if in_impl {
                 SymbolKind::Method
             } else {
@@ -97,7 +106,8 @@ fn symbol_name(node: Node, src: &[u8]) -> Option<String> {
 /// Header text from the item's start up to (not including) its body brace —
 /// the `body` field for kinds that have one (`fn`/`struct`/`enum`/`trait`/
 /// `impl`/`mod`), or the item's full span for the brace-less kinds
-/// (`const`/`static`/`type`, which end in `;`).
+/// (`const`/`static`/`type`, and bodyless `fn foo(&self);` trait
+/// declarations, all of which end in `;` instead of a body).
 fn signature_of(node: Node, src: &[u8]) -> String {
     let end = node
         .child_by_field_name("body")

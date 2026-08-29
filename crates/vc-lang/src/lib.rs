@@ -87,4 +87,37 @@ fn free() {}
     fn unknown_language_yields_empty() {
         assert!(symbols("x", "").unwrap().is_empty());
     }
+
+    #[test]
+    fn genuinely_unparseable_non_blank_source_is_malformed() {
+        let err = symbols("\u{0}\u{1}{{{{", "rust").unwrap_err();
+        assert_eq!(err.kind, velocity_code_kernel::ErrorKind::Malformed);
+        assert!(err.message.contains("rust"));
+
+        let err2 = symbols("this is not rust code at all, just prose.", "rust").unwrap_err();
+        assert_eq!(err2.kind, velocity_code_kernel::ErrorKind::Malformed);
+    }
+
+    #[test]
+    fn empty_source_yields_empty_not_malformed() {
+        assert!(symbols("", "rust").unwrap().is_empty());
+    }
+
+    #[test]
+    fn extracts_bodyless_and_default_bodied_trait_methods() {
+        let src = r#"
+trait Greeter {
+    fn name(&self) -> String;
+    fn greet(&self) -> String { format!("hi {}", self.name()) }
+}
+"#;
+        let syms = symbols(src, "rust").unwrap();
+        let find = |n: &str| syms.iter().find(|s| s.name == n).unwrap();
+        let name = find("name");
+        assert_eq!(name.kind, SymbolKind::Function);
+        assert!(name.signature.contains("fn name(&self) -> String"));
+        let greet = find("greet");
+        assert_eq!(greet.kind, SymbolKind::Function);
+        assert!(greet.signature.contains("fn greet(&self) -> String"));
+    }
 }
