@@ -130,6 +130,75 @@ fn json_error_shape_on_stale_apply() {
     assert!(!v["error"]["message"].as_str().unwrap().is_empty());
 }
 
+/// I3 regression: a stale apply's `next:` hint must name a real
+/// subcommand, and that subcommand must actually recover. Drift here
+/// leaves the OLD TEXT (`old_name`) present but appends a line, so the
+/// plan's edit would still *resolve* — it's the file's overall content
+/// (and therefore its plan-time hash) that changed, which is exactly what
+/// `apply` refuses on. `vc plan refresh <sha8>` re-resolves the same
+/// edit against current content and mints a brand-new plan, which then
+/// applies cleanly.
+#[test]
+fn stale_apply_hint_names_plan_refresh_which_recovers() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn old_name() {}\n").unwrap();
+
+    let out = vc(r)
+        .args([
+            "--json", "plan", "edit", "a.rs", "--old", "old_name", "--new", "new_name",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let sha8 = serde_json::from_slice::<serde_json::Value>(&out).unwrap()["sha8"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Drift: append a line after planning. "old_name" is still present
+    // (re-resolution will succeed), but the file's hash has changed, so
+    // `apply` must refuse as stale.
+    std::fs::write(r.join("a.rs"), "fn old_name() {}\n// drifted\n").unwrap();
+
+    let assert = vc(r)
+        .args(["--json", "apply", &sha8])
+        .assert()
+        .failure()
+        .code(3);
+    let stdout = assert.get_output().stdout.clone();
+    let v: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(v["error"]["kind"].as_str().unwrap(), "stale");
+    assert_eq!(
+        v["error"]["next"].as_str().unwrap(),
+        format!("vc plan refresh {sha8}"),
+        "the hint must name the real `plan refresh` subcommand"
+    );
+
+    // Run the hint's own command — it must exist and must recover.
+    let out = vc(r)
+        .args(["--json", "plan", "refresh", &sha8])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let sha8b = v["sha8"].as_str().unwrap().to_string();
+    assert_ne!(
+        sha8b, sha8,
+        "refresh must mint a new plan against the drifted content"
+    );
+
+    vc(r).args(["apply", &sha8b]).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(r.join("a.rs")).unwrap(),
+        "fn new_name() {}\n// drifted\n"
+    );
+}
+
 /// Own test: `doctor --rollback --discard` together is a usage error
 /// (exit 2), not silently picking one action.
 #[test]

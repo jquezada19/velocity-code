@@ -328,7 +328,7 @@ fn verify_files(root: &Path, p: &plan::Plan) -> VcResult<BTreeMap<PathBuf, Vec<u
             ErrorKind::Stale,
             format!("changed since plan: {}", display_list(&stale)),
         )
-        .with_next(format!("vc plan --refresh {}", p.sha8())));
+        .with_next(format!("vc plan refresh {}", p.sha8())));
     }
     Ok(verified)
 }

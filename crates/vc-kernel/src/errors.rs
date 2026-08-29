@@ -87,10 +87,10 @@ mod tests {
     #[test]
     fn display_uses_error_grammar() {
         let e = VcError::new(ErrorKind::Stale, "src/config.rs changed since plan")
-            .with_next("vc plan --refresh 77bd02aa");
+            .with_next("vc plan refresh 77bd02aa");
         assert_eq!(
             e.to_string(),
-            "stale: src/config.rs changed since plan — next: vc plan --refresh 77bd02aa"
+            "stale: src/config.rs changed since plan — next: vc plan refresh 77bd02aa"
         );
         let e2 = VcError::new(ErrorKind::Io, "permission denied");
         assert_eq!(e2.to_string(), "io: permission denied");

@@ -16,8 +16,9 @@ use std::io::Read as _;
 use std::path::Path;
 use velocity_code_kernel::{
     ErrorKind, VcError, VcResult,
-    plan::{Plan, PlanForm},
+    plan::{Plan, PlanForm, b64d},
     recover::{self, DoctorAction},
+    resolve::EditRequest,
     {apply, index, root},
 };
 use velocity_code_select::{edits_from_args, edits_from_diff};
@@ -70,6 +71,16 @@ enum PlanCmd {
     },
     /// Reads a unified diff from stdin.
     Import,
+    /// Re-resolve a stored plan's edits against CURRENT file content and
+    /// store the result as a new plan. This is what a `Stale` apply
+    /// refusal's `next:` hint points at (I3): the old plan's edits are
+    /// still exactly what was asked for, only the file has moved on since
+    /// it was made, so refresh re-runs the same resolution fresh rather
+    /// than asking the caller to redo the whole `plan edit`/`plan import`
+    /// from scratch. If the old text no longer exists (or is now
+    /// ambiguous), the ordinary resolve error surfaces — that's correct:
+    /// refresh does not paper over an edit that no longer applies.
+    Refresh { sha8: String },
 }
 
 fn verb_name(cmd: &Cmd) -> &'static str {
@@ -156,6 +167,22 @@ fn cmd_plan(root: &Path, cwd: &Path, form: &PlanCmd) -> VcResult<CmdOutcome> {
             std::io::stdin().read_to_string(&mut diff_text)?;
             let reqs = edits_from_diff(&diff_text)?;
             (PlanForm::Import, reqs)
+        }
+        PlanCmd::Refresh { sha8 } => {
+            let stale_plan = Plan::load(root, sha8)?;
+            let reqs = stale_plan
+                .edits
+                .iter()
+                .map(|e| {
+                    Ok(EditRequest {
+                        path: e.path.clone(),
+                        old: b64d(&e.old_b64)?,
+                        new: b64d(&e.new_b64)?,
+                        line_hint: None,
+                    })
+                })
+                .collect::<VcResult<Vec<EditRequest>>>()?;
+            (stale_plan.form, reqs)
         }
     };
 

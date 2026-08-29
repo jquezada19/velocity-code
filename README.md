@@ -8,10 +8,10 @@ Status: pre-release, milestone 1 (transactional nucleus) in progress. Benchmarks
 
 ```
 $ vc plan edit src/f.rs --old "let v = 1" --new "let v = 2"
-plan 2694379f — 1 sites, 1 files @ epoch 8a6ace23   (preview: vc show 2694379f)
+plan 8fc798fd — 1 sites, 1 files @ epoch 8a6ace23   (preview: vc show 8fc798fd)
 $ echo '// concurrent addition' >> src/f.rs
-$ vc apply 2694379f
-stale: changed since plan: src/f.rs — next: vc plan --refresh 2694379f
+$ vc apply 8fc798fd
+stale: changed since plan: src/f.rs — next: vc plan refresh 8fc798fd
 $ echo $?
 3
 $ cat src/f.rs
@@ -28,7 +28,7 @@ tool, working from the same remembered `old`/`new`, has no such check —
 run against the identical drifted file:
 
 ```
-$ python3 -c "open('src/f.rs','w').write(open('src/f.rs').read().replace('let v = 1','let v = 2'))"
+$ python3 -c "content = open('src/f.rs').read(); open('src/f.rs', 'w').write(content.replace('let v = 1', 'let v = 2'))"
 $ cat src/f.rs
 fn target() {
     let v = 2;
