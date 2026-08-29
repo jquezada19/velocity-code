@@ -136,6 +136,15 @@ impl Journal {
         let (mut committed, _) = Self::scan(root)?;
         Ok(committed.pop())
     }
+
+    /// Whether `id`'s commit marker exists — i.e. whether `id` names a
+    /// committed entry (as opposed to a journaled-but-not-yet-committed
+    /// one a crash or a write failure left behind). Infallible: any id,
+    /// including one with no entry file at all, that lacks a marker
+    /// simply reads as not committed.
+    pub fn is_committed(root: &Path, id: &str) -> bool {
+        marker_path(&journal_dir(root), id).is_file()
+    }
 }
 
 /// Open `dir` and fsync it — durably persists directory-entry changes
@@ -203,6 +212,22 @@ mod tests {
         let (_d, r) = setup();
         let err = Journal::load(&r, "j-999999").unwrap_err();
         assert!(matches!(err.kind, ErrorKind::NotFound));
+    }
+
+    /// L: `is_committed` reflects marker presence directly, independent
+    /// of `scan`/`apply`/`undo` — the predicate `undo` gates on before
+    /// touching an explicit-id target.
+    #[test]
+    fn is_committed_reflects_marker_presence() {
+        let (_d, r) = setup();
+        Journal::write_entry(&r, &entry("j-000001")).unwrap();
+        assert!(!Journal::is_committed(&r, "j-000001"), "no marker yet");
+        Journal::mark_committed(&r, "j-000001").unwrap();
+        assert!(Journal::is_committed(&r, "j-000001"));
+        assert!(
+            !Journal::is_committed(&r, "j-999999"),
+            "nonexistent id is not committed"
+        );
     }
 
     /// Own test #2: write_entry creates `.vc/journal/` itself when absent —

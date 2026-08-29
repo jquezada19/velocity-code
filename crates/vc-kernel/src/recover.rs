@@ -178,7 +178,31 @@ fn doctor_mutate(root: &Path, restore: bool) -> VcResult<DoctorReport> {
 fn restore_entry(root: &Path, id: &str) -> VcResult<()> {
     let entry = journal::Journal::load(root, id)?;
     for fi in &entry.files {
+        // B4: a journal path must be relative with no `..` components
+        // before it's ever joined onto `root`. Checked first, before the
+        // pre-image itself is even decoded — a violation here means the
+        // entry is untrustworthy regardless of what its bytes say.
+        if !crate::path_is_root_relative(&fi.path) {
+            return Err(VcError::new(
+                ErrorKind::Malformed,
+                format!(
+                    "{}: journal path must be relative with no '..' components",
+                    fi.path.display()
+                ),
+            ));
+        }
         let bytes = plan::b64d(&fi.pre_b64)?;
+        // G: the pre-image about to be written back must itself be
+        // intact — its hash must still equal what was journaled when it
+        // was recorded. A hand-corrupted `pre_b64` (still valid base64,
+        // wrong bytes) with `pre_hash` left untouched must refuse rather
+        // than restore the wrong content over the target.
+        if crate::hash::bytes_hash(&bytes) != fi.pre_hash {
+            return Err(VcError::new(
+                ErrorKind::Malformed,
+                "journal pre-image corrupt",
+            ));
+        }
         write_through(root, &fi.path, &bytes)?;
     }
     Ok(())
@@ -209,17 +233,24 @@ enum LockState {
 /// `LockState` rather than propagating an `Io` error — a lock file is
 /// exactly the kind of thing `doctor` exists to make sense of even when
 /// it's in a bad state.
+///
+/// The content is parsed strictly as a `u32` greater than 1 before it is
+/// ever treated as a real pid: garbage text, a negative number, `0`, and
+/// a number too large to be a pid (overflow) all fail to parse and count
+/// as stale. This matters beyond input hygiene — `kill -0 <pid>` gives
+/// `-1` special broadcast meaning (signal every process the caller may
+/// signal), which reliably *succeeds*, so passing a raw, unvalidated
+/// "-1" straight to `pid_is_alive` would make a garbage lock look alive
+/// (and therefore permanently unrecoverable) instead of stale.
 fn inspect_lock(root: &Path) -> LockState {
     let content = match std::fs::read_to_string(lock_path(root)) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LockState::Absent,
         Err(_) => return LockState::Stale,
     };
-    let pid = content.trim();
-    if !pid.is_empty() && pid_is_alive(pid) {
-        LockState::Alive(pid.to_string())
-    } else {
-        LockState::Stale
+    match content.trim().parse::<u32>() {
+        Ok(pid) if pid > 1 && pid_is_alive(&pid.to_string()) => LockState::Alive(pid.to_string()),
+        _ => LockState::Stale,
     }
 }
 
@@ -266,11 +297,22 @@ fn remove_stale_lock(root: &Path) -> VcResult<()> {
 /// write. Replicated rather than called: `apply`'s helper isn't exported,
 /// and `doctor` restores straight from a journaled pre-image with no plan
 /// involved, so it deliberately never routes through `apply_plan`/`undo`.
+///
+/// The temp name is `.vc-tmp-<name>.<pid>.<monotonic-nanos>` (unique
+/// enough that a leftover temp file from a crashed prior run essentially
+/// cannot collide with it), created with `create_new` rather than the old
+/// plain "create" — a residual collision errors out cleanly instead of
+/// truncating whatever another write's in-flight temp file held. See
+/// `apply.rs`'s copy of this same fix for the full rationale.
 fn write_through(root: &Path, rel: &Path, content: &[u8]) -> VcResult<()> {
     let abs = root.join(rel);
     let dir = abs.parent().unwrap_or(root);
     let file_name = abs.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let tmp = dir.join(format!(".vc-tmp-{file_name}"));
+    let tmp = dir.join(format!(
+        ".vc-tmp-{file_name}.{}.{}",
+        std::process::id(),
+        monotonic_nanos()
+    ));
 
     if let Err(e) = write_and_rename(&tmp, &abs, content) {
         let _ = std::fs::remove_file(&tmp);
@@ -279,8 +321,21 @@ fn write_through(root: &Path, rel: &Path, content: &[u8]) -> VcResult<()> {
     Ok(())
 }
 
+/// See `apply.rs`'s identical helper — a monotonic, per-process
+/// nanosecond counter used solely to make the temp file name unique.
+fn monotonic_nanos() -> u128 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos()
+}
+
 fn write_and_rename(tmp: &Path, dest: &Path, content: &[u8]) -> VcResult<()> {
-    let mut f = std::fs::File::create(tmp)?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)?;
     f.write_all(content)?;
     f.sync_all()?;
     std::fs::rename(tmp, dest)?;
@@ -375,6 +430,30 @@ mod tests {
         );
         let (c, u) = Journal::scan(&r).unwrap();
         assert!(c.is_empty() && u.is_empty());
+    }
+
+    /// K: a lock file whose content isn't a valid, sane pid — garbage
+    /// text, `0`, a negative number, or a number too large to be a pid —
+    /// must be treated as stale rather than handed raw to `kill`. Before
+    /// this check, "-1" in particular was actively dangerous: `kill -0
+    /// -1` signals every process the caller may signal (broadcast) and
+    /// would report success, making a garbage lock look ALIVE and
+    /// permanently unrecoverable.
+    #[test]
+    fn rollback_treats_unparseable_or_out_of_range_pid_locks_as_stale() {
+        for bad in ["-1", "0", "not-a-pid", "99999999999999999999"] {
+            let d = tempfile::tempdir().unwrap();
+            let r = d.path().to_path_buf();
+            std::fs::create_dir_all(r.join(".vc/journal")).unwrap();
+            std::fs::write(r.join(".vc/journal/LOCK"), bad).unwrap();
+
+            let rep = doctor(&r, DoctorAction::Rollback).unwrap();
+            assert!(
+                rep.lock_removed,
+                "lock content {bad:?} must be treated as stale, not alive"
+            );
+            assert!(!r.join(".vc/journal/LOCK").exists());
+        }
     }
 
     /// Own test (c): a stale lock — pid that can't possibly be running —
@@ -496,6 +575,107 @@ mod tests {
         assert_eq!(
             std::fs::read(r.join("a.rs")).unwrap(),
             b"untouched".to_vec()
+        );
+    }
+
+    /// B4: a journal entry whose file path escapes via `..` must be
+    /// refused (`Malformed`) before `restore_entry` ever joins it onto
+    /// `root` — and the entry file itself must be left in place (not
+    /// deleted), so a retry after the corruption is fixed finds it again
+    /// rather than silently losing track of it.
+    #[test]
+    fn rollback_refuses_journal_entry_with_dotdot_path_and_preserves_entry() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().to_path_buf();
+        std::fs::create_dir_all(r.join(".vc/journal")).unwrap();
+        let e = JournalEntry {
+            id: "j-000001".into(),
+            plan_id: "p".repeat(64),
+            created_unix: 1,
+            files: vec![FileImage {
+                path: "../escape.rs".into(),
+                pre_b64: crate::plan::b64e(b"original"),
+                pre_hash: crate::hash::bytes_hash(b"original"),
+                post_hash: crate::hash::bytes_hash(b"halfway"),
+            }],
+        };
+        Journal::write_entry(&r, &e).unwrap(); // uncommitted
+
+        let err = doctor(&r, DoctorAction::Rollback).unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::Malformed));
+        let (_c, u) = Journal::scan(&r).unwrap();
+        assert_eq!(u, vec!["j-000001"], "entry preserved, not deleted");
+    }
+
+    /// G (doctor): a committed... no, an *uncommitted* entry's `pre_b64`
+    /// hand-corrupted (still valid base64, wrong bytes) without touching
+    /// its recorded `pre_hash` must refuse the rollback as `Malformed`
+    /// rather than write the wrong bytes over the target — and, as with
+    /// B4 above, the entry file must survive so a retry can find it.
+    #[test]
+    fn rollback_refuses_corrupt_pre_image_and_preserves_entry_and_target() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().to_path_buf();
+        std::fs::create_dir_all(r.join(".vc/journal")).unwrap();
+        std::fs::write(r.join("a.rs"), "halfway-written").unwrap();
+
+        let e = JournalEntry {
+            id: "j-000001".into(),
+            plan_id: "p".repeat(64),
+            created_unix: 1,
+            files: vec![FileImage {
+                path: "a.rs".into(),
+                pre_b64: crate::plan::b64e(b"TAMPERED!"),
+                pre_hash: crate::hash::bytes_hash(b"original"),
+                post_hash: crate::hash::bytes_hash(b"halfway-written"),
+            }],
+        };
+        Journal::write_entry(&r, &e).unwrap();
+
+        let err = doctor(&r, DoctorAction::Rollback).unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::Malformed));
+        assert_eq!(
+            std::fs::read(r.join("a.rs")).unwrap(),
+            b"halfway-written".to_vec(),
+            "target must be untouched"
+        );
+        let (_c, u) = Journal::scan(&r).unwrap();
+        assert_eq!(u, vec!["j-000001"], "entry file preserved for retry");
+    }
+
+    /// H (recover's own `write_through`/`write_and_rename` copy): a
+    /// pre-existing file at the OLD, unqualified `.vc-tmp-<name>` name
+    /// must survive a rollback untouched — the real temp file used lands
+    /// at a different, pid+nanos-qualified name.
+    #[test]
+    fn rollback_write_never_collides_with_a_preexisting_dotvc_tmp_file() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().to_path_buf();
+        std::fs::create_dir_all(r.join(".vc/journal")).unwrap();
+        std::fs::write(r.join("a.rs"), "halfway-written").unwrap();
+        let sentinel_path = r.join(".vc-tmp-a.rs");
+        std::fs::write(&sentinel_path, b"SENTINEL-do-not-touch").unwrap();
+
+        let e = JournalEntry {
+            id: "j-000001".into(),
+            plan_id: "p".repeat(64),
+            created_unix: 1,
+            files: vec![FileImage {
+                path: "a.rs".into(),
+                pre_b64: crate::plan::b64e(b"original"),
+                pre_hash: crate::hash::bytes_hash(b"original"),
+                post_hash: crate::hash::bytes_hash(b"halfway-written"),
+            }],
+        };
+        Journal::write_entry(&r, &e).unwrap();
+
+        let rep = doctor(&r, DoctorAction::Rollback).unwrap();
+        assert_eq!(rep.rolled_back, vec!["j-000001"]);
+        assert_eq!(std::fs::read(r.join("a.rs")).unwrap(), b"original".to_vec());
+        assert_eq!(
+            std::fs::read(&sentinel_path).unwrap(),
+            b"SENTINEL-do-not-touch".to_vec(),
+            "a pre-existing file at the OLD unqualified temp name must survive untouched"
         );
     }
 }
