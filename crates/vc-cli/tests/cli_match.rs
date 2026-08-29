@@ -319,3 +319,98 @@ fn match_plan_with_skipped_file_stores_warning_and_show_prints_it() {
     );
     assert!(text.contains("did not parse"), "preview: {text}");
 }
+
+/// Fix round 1 (controller ruling): `vc show --json` must not widen the
+/// spec-pinned `{sha8, preview}` shape for a plan that has no warnings —
+/// `"warnings"` must be ABSENT, not present as an empty array. Pins the
+/// exact key set, not just individual key presence.
+#[test]
+fn show_json_omits_warnings_key_when_plan_has_none() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
+
+    let out = vc(r)
+        .args([
+            "--json",
+            "plan",
+            "match",
+            "--pattern",
+            "fetch_config($$$A)",
+            "--rewrite",
+            "load_config($$$A)",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let sha8 = serde_json::from_slice::<serde_json::Value>(&out).unwrap()["sha8"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let out = vc(r)
+        .args(["--json", "show", &sha8])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let obj = v.as_object().unwrap();
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["preview", "sha8"],
+        "warnings-less plan must have EXACTLY {{sha8, preview}}, no stray warnings key"
+    );
+}
+
+/// The mirror case: a match plan WITH a stored warning must include the
+/// `warnings` array in `vc show --json`, alongside the exact same
+/// `{sha8, preview}` pair.
+#[test]
+fn show_json_includes_warnings_key_when_plan_has_some() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("good.rs"), "fn main() { fetch_config(a); }\n").unwrap();
+    std::fs::write(r.join("bad.rs"), "fn broken( { fetch_config(a) ]]]\n").unwrap();
+
+    let out = vc(r)
+        .args([
+            "--json",
+            "plan",
+            "match",
+            "--pattern",
+            "fetch_config($$$A)",
+            "--rewrite",
+            "load_config($$$A)",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let sha8 = serde_json::from_slice::<serde_json::Value>(&out).unwrap()["sha8"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let out = vc(r)
+        .args(["--json", "show", &sha8])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let obj = v.as_object().unwrap();
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["preview", "sha8", "warnings"]);
+    let warnings = v["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].as_str().unwrap().contains("bad.rs"));
+}

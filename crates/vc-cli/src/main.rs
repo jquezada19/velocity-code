@@ -487,11 +487,18 @@ fn cmd_show(root: &Path, sha8: &str) -> VcResult<CmdOutcome> {
         human.push_str(&format!("warning: {w}\n"));
     }
 
-    let json = serde_json::json!({
+    // Fix round 1 (controller ruling): `warnings` widens the spec-pinned
+    // `{sha8, preview}` `--json` shape, so it must appear ONLY when
+    // non-empty — mirroring `Plan`'s own `skip_serializing_if` philosophy
+    // for `selector`/`certificate`/`warnings` (see plan.rs) rather than
+    // always emitting `"warnings": []` for every edit/import plan.
+    let mut json = serde_json::json!({
         "sha8": sha8_full,
         "preview": preview,
-        "warnings": plan.warnings,
     });
+    if !plan.warnings.is_empty() {
+        json["warnings"] = serde_json::json!(plan.warnings);
+    }
     Ok(CmdOutcome {
         human,
         json,
