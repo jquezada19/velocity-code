@@ -19,9 +19,12 @@
 //!    computed against the *original* tree — no reparse between matches, so
 //!    offsets never shift underneath us.
 //! 3. **Refuse rather than guess.** Overlapping matches, an unparseable
-//!    pattern, a rewrite naming a metavariable the pattern never binds, and
-//!    an unknown language are all refusals at plan time, not surprises at
-//!    apply time.
+//!    pattern, a pattern containing the expando character, a rewrite whose
+//!    metavariable the pattern does not bind *in the same sigil form*, and an
+//!    unknown language are all refusals at plan time, not surprises at apply
+//!    time. See [`build_pattern`] for why each of the metavariable refusals
+//!    exists: ast-grep substitutes silently rather than erroring, so an
+//!    unrefused mismatch deletes arguments instead of failing.
 //!
 //! `vc-select` exposes no write API. `match_sites` reads files and returns
 //! bytes; only `vc-kernel` writes.
@@ -119,19 +122,123 @@ fn usage(msg: impl Into<String>) -> VcError {
     VcError::new(ErrorKind::Usage, msg)
 }
 
+/// Which sigil a metavariable occurrence was written with. `$NAME` binds one
+/// node; `$$$NAME` binds a list of them. ast-grep tracks these as different
+/// `MetaVariable` variants and stores them in different halves of the
+/// `MetaVarEnv`, but reports both under the bare name from
+/// `Pattern::defined_vars` and `TemplateFix::used_vars` — which is exactly
+/// why [`build_pattern`] cannot check names alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Sigil {
+    Single,
+    Multi,
+}
+
+impl Sigil {
+    fn render(self, name: &str) -> String {
+        match self {
+            Sigil::Single => format!("${name}"),
+            Sigil::Multi => format!("$$${name}"),
+        }
+    }
+}
+
+/// The characters ast-grep accepts inside a metavariable name. Mirrors
+/// `ast_grep_core::meta_var::is_valid_meta_var_char`, which is crate-private:
+/// `A`-`Z`, `_`, `0`-`9`.
+fn is_meta_var_char(c: char) -> bool {
+    c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit()
+}
+
+/// Scan `s` for metavariable occurrences the way ast-grep's own template
+/// expander does (`split_first_meta_var`, driven by `create_template`),
+/// returning each name with every sigil form it was written with.
+///
+/// The dollar-run rule is ast-grep's, quirks included: a run of three `$`
+/// makes a list capture, a run of one *or two* makes a single capture (`$$A`
+/// is `$A`), and a run followed by no valid name is literal text, skipped one
+/// byte at a time. Byte indexing is safe because `$` is ASCII and can never
+/// appear as a UTF-8 continuation byte, so a name always starts on a char
+/// boundary.
+fn metavar_forms(s: &str) -> BTreeMap<&str, BTreeSet<Sigil>> {
+    let bytes = s.as_bytes();
+    let mut out: BTreeMap<&str, BTreeSet<Sigil>> = BTreeMap::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        let mut dollars = 1usize;
+        while dollars < 3 && bytes.get(i + dollars) == Some(&b'$') {
+            dollars += 1;
+        }
+        let name_start = i + dollars;
+        let rest = &s[name_start..];
+        let name_len = rest
+            .find(|c: char| !is_meta_var_char(c))
+            .unwrap_or(rest.len());
+        if name_len == 0 {
+            i += 1;
+            continue;
+        }
+        let sigil = if dollars == 3 {
+            Sigil::Multi
+        } else {
+            Sigil::Single
+        };
+        out.entry(&s[name_start..name_start + name_len])
+            .or_default()
+            .insert(sigil);
+        i = name_start + name_len;
+    }
+    out
+}
+
 /// Build the pattern and validate the rewrite template against it.
 ///
-/// Two refusals beyond ast-grep's own parse errors:
+/// Three refusals beyond ast-grep's own parse errors:
 ///
-/// * `pattern.has_error()` — a pattern tree-sitter could only recover as an
-///   ERROR node. ast-grep will happily run it, but an ERROR-rooted pattern
+/// * **The expando character in the pattern.** `pre_process_pattern`
+///   rewrites every `$` to `µ` before handing the pattern to tree-sitter, so
+///   a `µ` the caller typed themselves is indistinguishable from one we
+///   substituted. `µA` is a legal Rust identifier, so the pattern
+///   `fetch_config(µA)` — which reads as a literal-identifier match — silently
+///   becomes a match-anything capture that would rewrite every call. Refuse
+///   any pattern containing `µ`. (The rewrite side is inert: templates are
+///   expanded against `meta_var_char()`, i.e. `$`, and never see the expando.)
+/// * **`pattern.has_error()`** — a pattern tree-sitter could only recover as
+///   an ERROR node. ast-grep will happily run it, but an ERROR-rooted pattern
 ///   reports `potential_kinds() == None`, i.e. "may match any node kind",
 ///   which is the worst possible input to a rewrite engine. Refuse.
-/// * A rewrite metavariable the pattern never binds. ast-grep's template
-///   expander substitutes *nothing* for an unbound variable, so `$$$B` in
-///   the rewrite of a `$$$A` pattern silently deletes the arguments instead
-///   of erroring. Refuse at plan time.
+/// * **A rewrite metavariable the pattern does not bind in the same form.**
+///   ast-grep's template expander substitutes *nothing* for a variable that
+///   is absent from the env, and `$A` / `$$$A` live in different halves of
+///   that env — so `$$$B` in the rewrite of a `$$$A` pattern, and equally
+///   `$$$A` in the rewrite of a `$A` pattern, both silently delete the
+///   arguments instead of erroring. Both are refused: the name must be bound
+///   (`Pattern::defined_vars`) *and* every sigil form the rewrite uses for it
+///   must be a form the pattern actually wrote.
+///
+/// **Residual, deliberately left open.** The sigil half is a string-level
+/// scan, so a `$` that tree-sitter absorbs into a terminal — inside a string
+/// literal or a comment in the *pattern* — is counted as a binding it isn't
+/// (`foo("$A")` scans as binding `$A`). That direction can only make the
+/// sigil check *permissive*, never falsely refusing; and the genuinely
+/// unbound case it might otherwise wave through is still caught by the
+/// `defined_vars` check, which reads the parsed tree rather than the text. A
+/// `$` inside a *rewrite* string literal needs no special handling: ast-grep's
+/// own expander is a string scan too, so it substitutes there and this scan
+/// agrees with it exactly.
 fn build_pattern(pattern: &str, rewrite: &str) -> VcResult<Pattern> {
+    let expando = RustLang.expando_char();
+    if pattern.contains(expando) {
+        return Err(usage(format!(
+            "pattern `{pattern}`: contains `{expando}`, which vc-select substitutes \
+             for `$` before parsing — it cannot be matched literally"
+        ))
+        .with_next("remove the expando character from the pattern"));
+    }
     let pat = Pattern::try_new(pattern, RustLang)
         .map_err(|e| usage(format!("pattern `{pattern}`: {e}")))?;
     if pat.has_error() {
@@ -139,21 +246,52 @@ fn build_pattern(pattern: &str, rewrite: &str) -> VcResult<Pattern> {
             "pattern `{pattern}`: does not parse as rust"
         )));
     }
+
     let defined = pat.defined_vars();
+    let pattern_forms = metavar_forms(pattern);
+    let rewrite_forms = metavar_forms(rewrite);
     let template = TemplateFix::try_new(rewrite, &RustLang)
         .map_err(|e| usage(format!("rewrite `{rewrite}`: {e}")))?;
-    let mut undefined: Vec<&str> = template
-        .used_vars()
-        .into_iter()
-        .filter(|v| !defined.contains(v))
-        .collect();
-    if !undefined.is_empty() {
-        undefined.sort_unstable();
-        return Err(usage(format!(
-            "rewrite `{rewrite}`: uses ${} but the pattern never binds it",
-            undefined.join(", $")
-        ))
-        .with_next("bind it in the pattern, or drop it from the rewrite"));
+    let mut used: Vec<&str> = template.used_vars().into_iter().collect();
+    used.sort_unstable();
+
+    let mut problems: Vec<String> = Vec::new();
+    for name in used {
+        if !defined.contains(name) {
+            problems.push(format!("${name} — the pattern never binds it"));
+            continue;
+        }
+        let bound = pattern_forms.get(name).cloned().unwrap_or_default();
+        let wanted = rewrite_forms.get(name).cloned().unwrap_or_default();
+        let missing: Vec<Sigil> = wanted
+            .iter()
+            .copied()
+            .filter(|f| !bound.contains(f))
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let want = missing
+            .iter()
+            .map(|f| f.render(name))
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let have = bound
+            .iter()
+            .map(|f| f.render(name))
+            .collect::<Vec<_>>()
+            .join(" / ");
+        problems.push(if have.is_empty() {
+            format!("{want} — the pattern never binds it")
+        } else {
+            format!("{want} — the pattern binds it as {have}")
+        });
+    }
+    if !problems.is_empty() {
+        return Err(
+            usage(format!("rewrite `{rewrite}`: {}", problems.join("; ")))
+                .with_next("use the same metavariable sigil in the rewrite as in the pattern"),
+        );
     }
     Ok(pat)
 }
@@ -593,6 +731,174 @@ mod tests {
             e.message.contains("multi meta variable"),
             "ast-grep's own message must survive: {}",
             e.message
+        );
+    }
+
+    /// Spans are BYTE offsets, not char offsets. The fixture puts two
+    /// multi-byte characters *before* the match, so a char-based range lands
+    /// three bytes short and `old` comes out as different text entirely. A
+    /// multi-byte argument inside the match exercises the rewrite side too.
+    #[test]
+    fn spans_are_byte_offsets_not_char_offsets() {
+        let d = tempfile::tempdir().unwrap();
+        // "// café ☕\n" is 10 chars but 13 bytes: é is 2, ☕ is 3.
+        let src = "// café ☕\nfn main() { fetch_config(café); }\n";
+        write(d.path(), "a.rs", src);
+
+        let (sites, content, warnings) = match_sites(
+            d.path(),
+            "fetch_config($$$A)",
+            "load_config($$$A)",
+            "rust",
+            &scope(&["a.rs"]),
+        )
+        .unwrap();
+
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(sites.len(), 1);
+
+        // The discriminating assertions: literal bytes, and a start that is
+        // the BYTE index (25) rather than the char index (22).
+        assert_eq!(sites[0].old, "fetch_config(café)".as_bytes());
+        assert_eq!(sites[0].new, "load_config(café)".as_bytes());
+        let byte_index = src.find("fetch_config").unwrap();
+        let char_index = src[..byte_index].chars().count();
+        assert_eq!(sites[0].start, byte_index);
+        assert_eq!(byte_index, 25);
+        assert_eq!(char_index, 22, "char and byte offsets must differ here");
+        assert_ne!(sites[0].start, char_index);
+
+        // And the splice still reproduces the whole-document rewrite.
+        let buf = &content[&PathBuf::from("a.rs")];
+        assert_eq!(buf, src.as_bytes());
+        let mut out = Vec::new();
+        out.extend_from_slice(&buf[..sites[0].start]);
+        out.extend_from_slice(&sites[0].new);
+        out.extend_from_slice(&buf[sites[0].end..]);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "// café ☕\nfn main() { load_config(café); }\n"
+        );
+    }
+
+    /// `$A` and `$$$A` are the same *name* but different bindings, stored in
+    /// different halves of ast-grep's `MetaVarEnv`. A name-only guard passes
+    /// this and ast-grep then substitutes nothing, silently emitting
+    /// `load_config()`. Both directions must refuse.
+    #[test]
+    fn metavariable_sigil_mismatch_is_usage_in_both_directions() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "a.rs", "fn main() { fetch_config(a) }\n");
+
+        // Pattern binds a single node; rewrite asks for a list.
+        let e = match_sites(
+            d.path(),
+            "fetch_config($A)",
+            "load_config($$$A)",
+            "rust",
+            &scope(&["a.rs"]),
+        )
+        .unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Usage);
+        assert!(e.message.contains("$$$A"), "message: {}", e.message);
+        assert!(
+            e.message.contains("binds it as $A"),
+            "both forms must be named: {}",
+            e.message
+        );
+
+        // Pattern binds a list; rewrite asks for a single node.
+        let e = match_sites(
+            d.path(),
+            "fetch_config($$$A)",
+            "load_config($A)",
+            "rust",
+            &scope(&["a.rs"]),
+        )
+        .unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Usage);
+        assert!(
+            e.message.contains("$A — the pattern binds it as $$$A"),
+            "both forms must be named: {}",
+            e.message
+        );
+
+        // Control: matching sigils on both sides are accepted.
+        for (p, r) in [
+            ("fetch_config($A)", "load_config($A)"),
+            ("fetch_config($$$A)", "load_config($$$A)"),
+        ] {
+            let (sites, _, _) = match_sites(d.path(), p, r, "rust", &scope(&["a.rs"])).unwrap();
+            assert_eq!(sites.len(), 1, "{p} -> {r}");
+            assert_eq!(sites[0].new, b"load_config(a)", "{p} -> {r}");
+        }
+    }
+
+    /// `µ` is the expando character the pattern compiler substitutes for `$`,
+    /// and `µA` is a legal Rust identifier — so a pattern the caller wrote as
+    /// a literal identifier match would silently become a match-anything
+    /// capture and rewrite every call site.
+    #[test]
+    fn expando_character_in_pattern_is_usage() {
+        let d = tempfile::tempdir().unwrap();
+        write(
+            d.path(),
+            "a.rs",
+            "fn main() { fetch_config(a); other(b); }\n",
+        );
+
+        let e = match_sites(
+            d.path(),
+            "fetch_config(µA)",
+            "load_config(µA)",
+            "rust",
+            &scope(&["a.rs"]),
+        )
+        .unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Usage);
+        assert!(e.message.contains('µ'), "message: {}", e.message);
+
+        // A bare `µ` identifier, with no metavariable shape at all, is
+        // refused just the same — the substitution is unconditional.
+        let e = match_sites(
+            d.path(),
+            "fetch_config(µ)",
+            "load_config(a)",
+            "rust",
+            &scope(&["a.rs"]),
+        )
+        .unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Usage);
+    }
+
+    /// The scan must agree with ast-grep's own dollar-run rule, quirks
+    /// included, or the sigil guard would refuse or admit the wrong things.
+    #[test]
+    fn metavar_scan_matches_ast_greps_dollar_run_rule() {
+        let forms = |s: &str| {
+            metavar_forms(s)
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.into_iter().collect::<Vec<_>>()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(forms("f($A)"), vec![("A".into(), vec![Sigil::Single])]);
+        assert_eq!(forms("f($$$A)"), vec![("A".into(), vec![Sigil::Multi])]);
+        // Two dollars is a SINGLE capture in ast-grep, not a list.
+        assert_eq!(forms("f($$A)"), vec![("A".into(), vec![Sigil::Single])]);
+        // A run with no valid name is literal text.
+        assert!(forms("f($)").is_empty());
+        assert!(forms("let x = 4;").is_empty());
+        // Lowercase is not a metavariable name character.
+        assert!(forms("f($a)").is_empty());
+        // Both forms of one name are recorded.
+        assert_eq!(
+            forms("f($A, $$$A)"),
+            vec![("A".into(), vec![Sigil::Single, Sigil::Multi])]
+        );
+        // Multi-byte text around a metavariable does not derail the scan.
+        assert_eq!(
+            forms("// café ☕ $A"),
+            vec![("A".into(), vec![Sigil::Single])]
         );
     }
 
