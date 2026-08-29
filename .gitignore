@@ -1,3 +1,4 @@
 /target
 .vc/
 .superpowers/
+harness/t9a/results-*.jsonl
