@@ -84,9 +84,9 @@ fn verb_name(cmd: &Cmd) -> &'static str {
     }
 }
 
-fn dispatch(root: &Path, cmd: &Cmd) -> VcResult<CmdOutcome> {
+fn dispatch(root: &Path, cwd: &Path, cmd: &Cmd) -> VcResult<CmdOutcome> {
     match cmd {
-        Cmd::Plan { form } => cmd_plan(root, form),
+        Cmd::Plan { form } => cmd_plan(root, cwd, form),
         Cmd::Show { sha8 } => cmd_show(root, sha8),
         Cmd::Apply { sha8 } => cmd_apply(root, sha8),
         Cmd::Undo { id } => cmd_undo(root, id.as_deref()),
@@ -96,17 +96,62 @@ fn dispatch(root: &Path, cmd: &Cmd) -> VcResult<CmdOutcome> {
     }
 }
 
+/// Rebase a user-supplied path argument — as typed on the command line,
+/// which the shell (and every user's mental model) resolves relative to
+/// the process's CWD — onto a root-relative path safe to hand to the
+/// kernel. The kernel always resolves edit paths against the repo root,
+/// never the CWD (`resolve::resolve_edits` does `root.join(&req.path)`),
+/// so without this, `vc plan edit note.txt` run from a subdirectory
+/// silently planned against the ROOT's `note.txt` instead of the
+/// subdirectory's — a different, wrong file, with no error (C2).
+///
+/// An absolute path is canonicalized as-is; a relative path is joined
+/// onto `cwd` first. Either way the result must canonicalize to somewhere
+/// inside `root` (canonicalizing both sides, not a lexical prefix strip,
+/// so a `..`-laden relative path or a symlink can't fake containment) —
+/// otherwise this refuses (`Usage`, exit 2) instead of silently operating
+/// on the wrong file or letting an edit escape the repo.
+///
+/// Only `plan edit`'s `file` argument goes through this — the only
+/// free-standing path argument the CLI takes. `plan import`'s diff-
+/// internal paths are deliberately exempt: by unified-diff convention
+/// they are already repo-relative (the `a/`/`b/` prefixes name paths from
+/// the repo root, not the CWD a diff happens to be generated or piped
+/// from), so rebasing them against CWD would be wrong, not a fix.
+fn rebase_user_path(root: &Path, cwd: &Path, user_path: &Path) -> VcResult<std::path::PathBuf> {
+    let root_real = root
+        .canonicalize()
+        .map_err(|e| VcError::new(ErrorKind::Io, format!("{}: {e}", root.display())))?;
+    let abs = if user_path.is_absolute() {
+        user_path.to_path_buf()
+    } else {
+        cwd.join(user_path)
+    };
+    let abs_real = abs
+        .canonicalize()
+        .map_err(|e| VcError::new(ErrorKind::Io, format!("{}: {e}", abs.display())))?;
+    abs_real
+        .strip_prefix(&root_real)
+        .map(|p| p.to_path_buf())
+        .map_err(|_| VcError::new(ErrorKind::Usage, "path outside repo root"))
+}
+
 /// `vc plan edit`/`vc plan import` -> resolve, digest, store. R1 (ledger
 /// ruling): `edit` takes exactly one `--old`/`--new` pair per invocation;
 /// a multi-edit plan goes through `import` in M1, repeatable `edit` pairs
 /// are M2 polish.
-fn cmd_plan(root: &Path, form: &PlanCmd) -> VcResult<CmdOutcome> {
+fn cmd_plan(root: &Path, cwd: &Path, form: &PlanCmd) -> VcResult<CmdOutcome> {
     let (plan_form, reqs) = match form {
         PlanCmd::Edit { file, old, new } => {
-            let reqs = edits_from_args(&[(file.clone(), old.clone(), new.clone())]);
+            let rel = rebase_user_path(root, cwd, file)?;
+            let reqs = edits_from_args(&[(rel, old.clone(), new.clone())]);
             (PlanForm::Edit, reqs)
         }
         PlanCmd::Import => {
+            // Diff-internal paths are NOT rebased against cwd — see
+            // `rebase_user_path`'s doc comment. A unified diff's `a/`/`b/`
+            // paths are repo-relative by convention, independent of
+            // wherever the diff itself was generated or piped from.
             let mut diff_text = String::new();
             std::io::stdin().read_to_string(&mut diff_text)?;
             let reqs = edits_from_diff(&diff_text)?;
@@ -313,7 +358,7 @@ fn main() {
 
     let verb = verb_name(&cli.cmd);
     let start = std::time::Instant::now();
-    let result = dispatch(&repo_root, &cli.cmd);
+    let result = dispatch(&repo_root, &cwd, &cli.cmd);
     let ms = start.elapsed().as_millis() as u64;
 
     let (files, edits, epoch8, refusal) = match &result {

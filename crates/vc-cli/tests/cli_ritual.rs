@@ -261,6 +261,91 @@ fn plan_import_adding_plusplus_line_actually_adds_it() {
     );
 }
 
+/// C2 regression: `vc plan edit <file>` run from a subdirectory must
+/// resolve `<file>` against the CWD (the shell/user's frame of reference),
+/// not silently against the repo root — a repo with a same-named file at
+/// both the root and in `sub/` must edit the SUBDIRECTORY's file when run
+/// from `sub/`, leaving the root twin untouched.
+#[test]
+fn plan_edit_from_subdirectory_resolves_subdirectory_file_not_root_twin() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    // Pin `r` as the discovered root so `find_root` doesn't fall back to
+    // `sub/` itself for lack of any `.vc` dir anywhere up the tree.
+    std::fs::create_dir_all(r.join(".vc")).unwrap();
+    std::fs::write(r.join("note.txt"), "root version\n").unwrap();
+    std::fs::create_dir_all(r.join("sub")).unwrap();
+    std::fs::write(r.join("sub/note.txt"), "sub version\n").unwrap();
+
+    let sub = r.join("sub");
+    let out = vc(&sub)
+        .args([
+            "--json",
+            "plan",
+            "edit",
+            "note.txt",
+            "--old",
+            "sub version",
+            "--new",
+            "SUB VERSION",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let sha8 = serde_json::from_slice::<serde_json::Value>(&out).unwrap()["sha8"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    vc(&sub).args(["apply", &sha8]).assert().success();
+
+    assert_eq!(
+        std::fs::read_to_string(r.join("sub/note.txt")).unwrap(),
+        "SUB VERSION\n",
+        "the subdirectory's own file must be the one edited"
+    );
+    assert_eq!(
+        std::fs::read_to_string(r.join("note.txt")).unwrap(),
+        "root version\n",
+        "the root twin must be left untouched"
+    );
+}
+
+/// C2 regression: an absolute path argument that resolves outside the
+/// repo root must refuse (`Usage`, exit 2) rather than being silently
+/// accepted or escaping the repo.
+#[test]
+fn plan_edit_absolute_path_outside_root_is_usage_error() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn old_name() {}\n").unwrap();
+
+    let outside = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("outside.txt");
+    std::fs::write(&outside_file, "hello\n").unwrap();
+
+    vc(r)
+        .args([
+            "plan",
+            "edit",
+            outside_file.to_str().unwrap(),
+            "--old",
+            "hello",
+            "--new",
+            "world",
+        ])
+        .assert()
+        .failure()
+        .code(2);
+
+    assert_eq!(
+        std::fs::read_to_string(&outside_file).unwrap(),
+        "hello\n",
+        "the out-of-root file must be untouched by the refusal"
+    );
+}
+
 /// Own test: `gain` on a repo with no `.vc/metrics/` at all (nothing has
 /// ever run) succeeds with an empty aggregate rather than erroring.
 #[test]
