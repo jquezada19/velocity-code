@@ -139,9 +139,20 @@ up; the refreshed plan then applies clean.
   N` in `--json`), for every one of `query`, `query --symbol`, `query --ast`,
   and `outline`.
 - `vc read` never truncates. A file, range, or `--symbol` read that would
-  exceed `--budget` refuses outright (`budget: <file> is ~N tokens (budget
-  M)`, exit 1) rather than handing back a partial read with no marker that
-  it was cut short.
+  exceed `--budget` refuses outright — the full shape, hint included like
+  every other exit-code example in this README:
+  `budget: a.rs is ~500 tokens (budget 200) — next: vc outline a.rs` (exit
+  1) — rather than handing back a partial read with no marker that it was
+  cut short.
+- A file that fails to parse (or isn't valid UTF-8) is skipped **with a
+  warning, never silently**. Dogfooding this on vc's own repo, `vc query
+  Plan --symbol` surfaced `warning: harness/r/corpus/sub/sub_kept.rs: rust:
+  source did not parse` on stderr for real, live — that file is one of R1's
+  own fixtures. `vc plan match` warnings from the same code path aren't
+  transient stderr-only noise: they're stored **on the plan itself** and
+  reappear whenever the plan is inspected — `vc show SHA8` prints any stored
+  warnings alongside the diff, so a file the selector silently couldn't
+  check stays visible for the life of the plan, not just at match time.
 
 R1 (spec §6) pins both read-verb ground truths as CI gates, reproducible
 locally: `harness/r/r1_lexical.sh` (parity with `rg` over
