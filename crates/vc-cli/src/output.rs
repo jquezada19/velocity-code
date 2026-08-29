@@ -48,6 +48,7 @@ pub fn error_kind_label(kind: ErrorKind) -> &'static str {
         ErrorKind::Malformed => "malformed",
         ErrorKind::Toctou => "toctou",
         ErrorKind::Io => "io",
+        ErrorKind::Budget => "budget",
     }
 }
 
@@ -106,6 +107,7 @@ mod tests {
         );
         assert_eq!(error_kind_label(ErrorKind::ScopeDrift), "scope-drift");
         assert_eq!(error_kind_label(ErrorKind::NotFound), "not-found");
+        assert_eq!(error_kind_label(ErrorKind::Budget), "budget");
     }
 
     #[test]

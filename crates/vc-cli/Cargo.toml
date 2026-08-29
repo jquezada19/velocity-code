@@ -19,6 +19,7 @@ serde_json.workspace = true
 velocity-code-kernel = { path = "../vc-kernel" }
 velocity-code-select = { path = "../vc-select" }
 velocity-code-query = { path = "../vc-query" }
+velocity-code-lang = { path = "../vc-lang" }
 
 [dev-dependencies]
 tempfile.workspace = true

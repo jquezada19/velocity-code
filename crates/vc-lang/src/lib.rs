@@ -3,6 +3,7 @@
 //! `vc-lang` is read-only — it parses source text handed to it and returns
 //! `Symbol`s. It never touches the filesystem and exposes no write API.
 
+pub mod outline;
 mod rust_symbols;
 
 use velocity_code_kernel::VcResult;

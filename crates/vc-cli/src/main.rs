@@ -15,7 +15,7 @@ use output::CmdOutcome;
 use std::io::Read as _;
 use std::path::Path;
 use velocity_code_kernel::{
-    ErrorKind, VcError, VcResult,
+    ErrorKind, VcError, VcResult, lang_tag,
     plan::{Plan, PlanForm, b64d},
     recover::{self, DoctorAction},
     resolve::EditRequest,
@@ -72,6 +72,23 @@ enum Cmd {
         budget: Option<usize>,
         paths: Vec<std::path::PathBuf>,
     },
+    Outline {
+        path: std::path::PathBuf,
+        #[arg(long)]
+        budget: Option<usize>,
+    },
+    Read {
+        /// `path[:a-b]` (1-based, inclusive). Omitted when `--symbol` is
+        /// given instead — checked in `cmd_read`, not `clap`, so both "no
+        /// path and no --symbol" and "both given" route through the normal
+        /// `VcError`/`--json` envelope, same pattern as `query`'s
+        /// `--symbol`/`--regex` check.
+        path: Option<String>,
+        #[arg(long)]
+        symbol: Option<String>,
+        #[arg(long)]
+        budget: Option<usize>,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -107,6 +124,8 @@ fn verb_name(cmd: &Cmd) -> &'static str {
         Cmd::Doctor { .. } => "doctor",
         Cmd::Gain { .. } => "gain",
         Cmd::Query { .. } => "query",
+        Cmd::Outline { .. } => "outline",
+        Cmd::Read { .. } => "read",
     }
 }
 
@@ -126,6 +145,12 @@ fn dispatch(root: &Path, cwd: &Path, cmd: &Cmd) -> VcResult<CmdOutcome> {
             budget,
             paths,
         } => cmd_query(root, cwd, pattern, *regex, *symbol, *budget, paths),
+        Cmd::Outline { path, budget } => cmd_outline(root, cwd, path, *budget),
+        Cmd::Read {
+            path,
+            symbol,
+            budget,
+        } => cmd_read(root, cwd, path.as_deref(), symbol.as_deref(), *budget),
     }
 }
 
@@ -597,6 +622,263 @@ fn cmd_query_symbol(
         epoch8,
         warning,
     })
+}
+
+/// `vc outline <path> [--budget N]` — read-only skeleton render, never
+/// touches a user file. `path` is rebased through the same
+/// [`rebase_user_path`] `plan edit`'s `file` argument uses, so it's
+/// interpreted relative to the CWD, not the repo root. The epoch stamp
+/// comes from a fresh `index::refresh`, matching `query`'s convention (no
+/// stored plan to read one off). Language is resolved from the
+/// root-relative path's extension via `lang_tag` — the same tag the stat
+/// index itself records — so an unsupported extension refuses through
+/// `velocity_code_lang::outline::outline`'s own `Usage` error rather than
+/// silently returning an empty skeleton.
+fn cmd_outline(
+    root: &Path,
+    cwd: &Path,
+    path: &std::path::Path,
+    budget: Option<usize>,
+) -> VcResult<CmdOutcome> {
+    let rel = rebase_user_path(root, cwd, path)?;
+    let (_ix, epoch) = index::refresh(root)?;
+    let epoch8 = index::epoch8(&epoch).to_string();
+
+    let src = std::fs::read_to_string(root.join(&rel))?;
+    let lang = lang_tag(&rel);
+    let (skeleton, elided) = velocity_code_lang::outline::outline(&src, lang, budget)?;
+
+    let mut human = format!("epoch {epoch8} — {elided} elided\n");
+    if !skeleton.is_empty() {
+        human.push_str(&skeleton);
+        human.push('\n');
+    }
+
+    let json = serde_json::json!({
+        "epoch8": epoch8,
+        "outline": skeleton,
+        "elided": elided,
+    });
+
+    Ok(CmdOutcome {
+        human,
+        json,
+        files: 1,
+        edits: 0,
+        epoch8,
+        warning: None,
+    })
+}
+
+/// `vc read <path[:a-b] | --symbol NAME> [--budget N]` — read-only,
+/// mutually exclusive path/`--symbol` modes checked here (not `clap`'s
+/// `conflicts_with`) for the same reason `query`'s `--symbol`/`--regex`
+/// check is: the refusal routes through the normal `VcError`/`--json`
+/// envelope.
+fn cmd_read(
+    root: &Path,
+    cwd: &Path,
+    path: Option<&str>,
+    symbol: Option<&str>,
+    budget: Option<usize>,
+) -> VcResult<CmdOutcome> {
+    match (path, symbol) {
+        (Some(_), Some(_)) => Err(VcError::new(
+            ErrorKind::Usage,
+            "read: <path> and --symbol are mutually exclusive",
+        )),
+        (None, None) => Err(VcError::new(
+            ErrorKind::Usage,
+            "read: pass a path, or --symbol NAME",
+        )),
+        (Some(p), None) => cmd_read_path(root, cwd, p, budget),
+        (None, Some(name)) => cmd_read_symbol(root, name, budget),
+    }
+}
+
+/// Splits a `read` path argument on its trailing `:a-b` range suffix, if
+/// any. Only a suffix that actually parses as two dash-separated `usize`s
+/// counts as a range — anything else (no colon, or a colon that isn't
+/// followed by a valid range) is treated as a plain path with no range,
+/// which also keeps a path containing an unrelated `:` from being
+/// misparsed.
+fn parse_range_suffix(s: &str) -> (&str, Option<(usize, usize)>) {
+    if let Some((file, range)) = s.rsplit_once(':')
+        && let Some((a, b)) = range.split_once('-')
+        && let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>())
+    {
+        return (file, Some((a, b)));
+    }
+    (s, None)
+}
+
+/// File/range `read` mode: exact requested lines, each prefixed `{line}:
+/// `. `:a-b` is 1-based inclusive; `a == 0` or `a > b` refuses `Usage`
+/// before ever touching the file. `b` beyond EOF clamps to the file's true
+/// last line rather than refusing — agents overshoot ranges constantly, and
+/// a clamp (with the true end reported back) is more useful than a
+/// refusal. No range at all reads the whole file. Over budget (when set)
+/// refuses via [`cmd_read_budget_check`] instead of silently truncating.
+fn cmd_read_path(
+    root: &Path,
+    cwd: &Path,
+    arg: &str,
+    budget: Option<usize>,
+) -> VcResult<CmdOutcome> {
+    let (file_str, range) = parse_range_suffix(arg);
+    if let Some((a, b)) = range
+        && (a == 0 || a > b)
+    {
+        return Err(VcError::new(
+            ErrorKind::Usage,
+            format!("read: invalid range {a}-{b}"),
+        ));
+    }
+
+    let rel = rebase_user_path(root, cwd, Path::new(file_str))?;
+    let (_ix, epoch) = index::refresh(root)?;
+    let epoch8 = index::epoch8(&epoch).to_string();
+
+    let content = std::fs::read_to_string(root.join(&rel))?;
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let (start, end) = match range {
+        Some((a, b)) => (a, b.min(total)),
+        None => (1, total),
+    };
+
+    let mut text = String::new();
+    for i in start..=end {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!("{i}: {}", lines[i - 1]));
+    }
+
+    let path_disp = rel.display().to_string();
+    cmd_read_budget_check(&path_disp, &text, budget)?;
+
+    let mut human = format!("epoch {epoch8} — {path_disp}:{start}-{end}\n");
+    if !text.is_empty() {
+        human.push_str(&text);
+        human.push('\n');
+    }
+    let json = serde_json::json!({
+        "epoch8": epoch8,
+        "path": path_disp,
+        "start": start,
+        "end": end,
+        "text": text,
+    });
+
+    Ok(CmdOutcome {
+        human,
+        json,
+        files: 1,
+        edits: 0,
+        epoch8,
+        warning: None,
+    })
+}
+
+/// `--symbol NAME` `read` mode: unique match -> its full body, line-
+/// prefixed the same way `cmd_read_path` renders a range. Zero matches ->
+/// `NotFound`; more than one -> `Ambiguous`, listing every candidate as
+/// `path:line` in the message so the caller can retry with an explicit
+/// range on the one they meant.
+fn cmd_read_symbol(root: &Path, name: &str, budget: Option<usize>) -> VcResult<CmdOutcome> {
+    let (_ix, epoch) = index::refresh(root)?;
+    let epoch8 = index::epoch8(&epoch).to_string();
+
+    let (hits, _fuzzy, warnings) = velocity_code_query::search_symbol(root, name, &[])?;
+    let hit = match hits.len() {
+        0 => {
+            return Err(
+                VcError::new(ErrorKind::NotFound, format!("{name}: no symbol found"))
+                    .with_next(format!("vc query {name} --symbol")),
+            );
+        }
+        1 => &hits[0],
+        n => {
+            let candidates = hits
+                .iter()
+                .map(|h| format!("{}:{}", h.path.display(), h.symbol.start_line))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(VcError::new(
+                ErrorKind::Ambiguous,
+                format!("{name}: {n} symbols match: {candidates}"),
+            ));
+        }
+    };
+
+    let content = std::fs::read_to_string(root.join(&hit.path))?;
+    let lines: Vec<&str> = content.lines().collect();
+    let start = hit.symbol.start_line;
+    let end = hit.symbol.end_line.min(lines.len());
+
+    let mut text = String::new();
+    for i in start..=end {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!("{i}: {}", lines[i - 1]));
+    }
+
+    let path_disp = hit.path.display().to_string();
+    cmd_read_budget_check(&path_disp, &text, budget)?;
+
+    let mut human = format!("epoch {epoch8} — {path_disp}:{start}-{end}\n");
+    if !text.is_empty() {
+        human.push_str(&text);
+        human.push('\n');
+    }
+    let json = serde_json::json!({
+        "epoch8": epoch8,
+        "path": path_disp,
+        "start": start,
+        "end": end,
+        "text": text,
+    });
+
+    // Same non-fatal-warning posture as `cmd_query_symbol`: a malformed
+    // file elsewhere in the search must not fail a read that found its
+    // target fine.
+    let warning = if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join("; "))
+    };
+
+    Ok(CmdOutcome {
+        human,
+        json,
+        files: 1,
+        edits: 0,
+        epoch8,
+        warning,
+    })
+}
+
+/// Shared over-budget refusal for both `read` modes: `budget: None` always
+/// passes. Otherwise, refuses with the new `ErrorKind::Budget` (controller
+/// ruling 2026-08-29 — a budget refusal is a fact about the requested
+/// content, not a malformed invocation, so it is deliberately not `Usage`)
+/// the moment the rendered text's `tokens_est` would exceed it, before any
+/// of that text reaches the caller — `read` never silently truncates.
+fn cmd_read_budget_check(path_disp: &str, text: &str, budget: Option<usize>) -> VcResult<()> {
+    let Some(budget) = budget else {
+        return Ok(());
+    };
+    let tokens = velocity_code_query::tokens_est(text.len());
+    if tokens > budget {
+        return Err(VcError::new(
+            ErrorKind::Budget,
+            format!("{path_disp} is ~{tokens} tokens (budget {budget})"),
+        )
+        .with_next(format!("vc outline {path_disp}")));
+    }
+    Ok(())
 }
 
 fn main() {

@@ -12,6 +12,14 @@ pub enum ErrorKind {
     Malformed,
     Toctou,
     Io,
+    /// `vc read` refusing to return content that would exceed a caller-set
+    /// `--budget` (M2 PR A, controller ruling 2026-08-29): deliberately its
+    /// own kind rather than reusing `Usage` — a budget refusal is a fact
+    /// about the *content* the caller asked for, not a malformed
+    /// invocation, and callers reroute on it differently (retry via `vc
+    /// outline`, not "fix your arguments"). Exit code 1, same bucket as
+    /// `NotFound`/`Ambiguous`/etc. — see `exit_code` below.
+    Budget,
 }
 
 impl ErrorKind {
@@ -27,6 +35,7 @@ impl ErrorKind {
             Self::Malformed => "malformed",
             Self::Toctou => "toctou",
             Self::Io => "io",
+            Self::Budget => "budget",
         }
     }
 }
@@ -58,6 +67,7 @@ impl VcError {
             ErrorKind::Stale => 3,
             ErrorKind::ScopeDrift => 4,
             ErrorKind::JournalBlocked => 5,
+            // NotFound, Ambiguous, Overlap, Malformed, Toctou, Io, Budget.
             _ => 1,
         }
     }
@@ -108,8 +118,24 @@ mod tests {
             ErrorKind::Malformed,
             ErrorKind::Toctou,
             ErrorKind::Io,
+            ErrorKind::Budget,
         ] {
             assert_eq!(VcError::new(k, "").exit_code(), 1);
         }
+    }
+
+    /// Budget's label + Display grammar, pinned directly (controller ruling
+    /// 2026-08-29): `vc read`'s over-budget refusal is `ErrorKind::Budget`,
+    /// not `Usage` — label "budget", exit code 1, same `kind: message —
+    /// next: ...` grammar as every other refusal.
+    #[test]
+    fn budget_kind_uses_budget_label_and_exit_code_one() {
+        let e = VcError::new(ErrorKind::Budget, "a.rs is ~500 tokens (budget 200)")
+            .with_next("vc outline a.rs");
+        assert_eq!(e.exit_code(), 1);
+        assert_eq!(
+            e.to_string(),
+            "budget: a.rs is ~500 tokens (budget 200) — next: vc outline a.rs"
+        );
     }
 }
