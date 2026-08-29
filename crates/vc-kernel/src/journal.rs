@@ -91,7 +91,7 @@ impl Journal {
         if !path.is_file() {
             return Err(
                 VcError::new(ErrorKind::NotFound, format!("no journal entry {id}"))
-                    .with_next("vc doctor"),
+                    .with_next("vc status"),
             );
         }
         let bytes = std::fs::read(&path)?;
