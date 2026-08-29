@@ -34,6 +34,38 @@ fn line_of(hay: &[u8], byte: usize) -> usize {
     1 + hay[..byte].iter().filter(|&&b| b == b'\n').count()
 }
 
+/// Sort `edits` by `(path, start)` in place and refuse (`ErrorKind::Overlap`,
+/// naming the file and both spans) if any two edits in the same file
+/// overlap. `apply::apply_plan`'s splice loop depends on exactly this
+/// invariant — "edits are non-overlapping and sorted" — and its
+/// pre-splice checks operate per-edit (range in bounds, old bytes match)
+/// so they cannot themselves detect a pair that overlaps each other; both
+/// would happily verify and both would splice, silently corrupting the
+/// file. Shared by [`resolve_edits_with_content`] (whose own resolution
+/// is normally overlap-free already, but this still guards it) and
+/// `Plan::build_match` (whose edits arrive from an external selector run,
+/// where an overlapping pair is a real, reachable case — e.g. a nested
+/// pattern match like `foo($$$A)` over `foo(foo(x))`).
+pub fn sort_and_refuse_overlaps(edits: &mut [ResolvedEdit]) -> VcResult<()> {
+    edits.sort_by(|a, b| a.path.cmp(&b.path).then(a.start.cmp(&b.start)));
+    for w in edits.windows(2) {
+        if w[0].path == w[1].path && w[1].start < w[0].end {
+            return Err(VcError::new(
+                ErrorKind::Overlap,
+                format!(
+                    "{}: edits at {}..{} and {}..{} overlap",
+                    w[0].path.display(),
+                    w[0].start,
+                    w[0].end,
+                    w[1].start,
+                    w[1].end
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Resolve `reqs` and return, alongside the resolved edits, every touched
 /// file's content as read to resolve them — each unique path read from
 /// disk exactly once, even when multiple requests target the same file.
@@ -107,22 +139,7 @@ pub fn resolve_edits_with_content(
             new_b64: b64e(&req.new),
         });
     }
-    out.sort_by(|a, b| a.path.cmp(&b.path).then(a.start.cmp(&b.start)));
-    for w in out.windows(2) {
-        if w[0].path == w[1].path && w[1].start < w[0].end {
-            return Err(VcError::new(
-                ErrorKind::Overlap,
-                format!(
-                    "{}: edits at {}..{} and {}..{} overlap",
-                    w[0].path.display(),
-                    w[0].start,
-                    w[0].end,
-                    w[1].start,
-                    w[1].end
-                ),
-            ));
-        }
-    }
+    sort_and_refuse_overlaps(&mut out)?;
     Ok((out, content_by_path))
 }
 

@@ -61,8 +61,17 @@ pub struct ProvenanceCert {
     pub epoch: String,
     /// Write-through index generation when the selector ran.
     pub generation: u64,
-    /// Every in-scope file, root-relative, -> its blake3 hex hash at plan
-    /// time.
+    /// `scope_files` = every file the selector could have seen at plan
+    /// time (scope walk ∩ selector.lang via `lang_tag`); the apply-time
+    /// drift check re-derives candidates with the identical definition
+    /// against the current tree — a changed or new selector-visible file
+    /// outside the plan's named set triggers a selector re-run.
+    /// (Controller ruling, review round 1, 2026-08-29: the cert's scope
+    /// must agree exactly with Task 14's re-derivation, so both sides use
+    /// this one filter — `walk::walk_scoped(selector.paths)` restricted
+    /// to entries where `lang_tag(path) == selector.lang` — rather than
+    /// the wider "every file in scope regardless of language" this
+    /// started as.)
     pub scope_files: BTreeMap<PathBuf, String>,
 }
 
@@ -193,7 +202,7 @@ impl Plan {
     pub fn build_match(
         root: &Path,
         selector: MatchSelector,
-        edits: Vec<ResolvedEdit>,
+        mut edits: Vec<ResolvedEdit>,
         content_by_path: &BTreeMap<PathBuf, Vec<u8>>,
     ) -> VcResult<Plan> {
         let root_real = root
@@ -214,6 +223,17 @@ impl Plan {
             }
         }
 
+        // CRITICAL (review round 1): unlike `build`'s edits, which come
+        // from `resolve_edits_with_content` and are already sorted and
+        // overlap-checked, `build_match`'s edits arrive verbatim from an
+        // external selector run — a nested pattern match (e.g. `foo($$$A)`
+        // over `foo(foo(x))`) can genuinely produce two overlapping sites.
+        // `apply::apply_plan`'s splice loop documents and depends on
+        // "edits are non-overlapping and sorted" and cannot itself detect
+        // a violation (its checks are per-edit), so this must be enforced
+        // here, before the plan is ever stored.
+        resolve::sort_and_refuse_overlaps(&mut edits)?;
+
         let mut files = BTreeMap::new();
         let mut realpaths = BTreeMap::new();
         for edit in &edits {
@@ -221,9 +241,20 @@ impl Plan {
                 continue;
             }
             let abs = root_real.join(&edit.path);
-            let content = content_by_path.get(&edit.path).expect(
-                "caller must supply content_by_path bytes for every edit's path (single-read discipline)",
-            );
+            // Unlike `build`'s internal `resolve_edits_with_content` call
+            // (where "every edit path has an entry" is an invariant this
+            // same function just established), `content_by_path` here
+            // crosses a public API boundary — a caller bug must surface
+            // as a refusal, not a panic.
+            let content = content_by_path.get(&edit.path).ok_or_else(|| {
+                VcError::new(
+                    ErrorKind::Usage,
+                    format!(
+                        "{}: no content supplied for this edit's path",
+                        edit.path.display()
+                    ),
+                )
+            })?;
             let file_hash = hash::bytes_hash(content);
             let real = abs
                 .canonicalize()
@@ -235,13 +266,20 @@ impl Plan {
         let (ix, epoch) = index::refresh(&root_real)?;
         let generation = ix.generation;
 
-        // The certificate covers the selector's whole scope, not just the
-        // files matched edits touch: a named file's hash reuses the bytes
-        // already in `content_by_path` (no second read); every other
-        // in-scope file is read fresh for its cert hash.
+        // The certificate covers the selector's whole VISIBLE scope, not
+        // just the files matched edits touch: a named file's hash reuses
+        // the bytes already in `content_by_path` (no second read); every
+        // other selector-visible file is read fresh for its cert hash.
+        // "Visible" = the scope walk filtered to `selector.lang` via
+        // `lang_tag` — see `ProvenanceCert::scope_files`'s doc comment for
+        // why this exact definition matters (Task 14's drift check must
+        // re-derive the identical set).
         let scoped = walk::walk_scoped(&root_real, &selector.paths)?;
         let mut scope_files = BTreeMap::new();
         for rel in scoped {
+            if crate::lang_tag(&rel) != selector.lang {
+                continue;
+            }
             let file_hash = match content_by_path.get(&rel) {
                 Some(content) => hash::bytes_hash(content),
                 None => hash::file_hash(&root_real.join(&rel))?,
@@ -662,15 +700,19 @@ mod tests {
 
     /// build_match populates files/realpaths/edits from the given
     /// `ResolvedEdit`s exactly like `build` does, but the certificate must
-    /// cover the whole selector scope — including `b.rs`, which is
-    /// in-scope but untouched by any edit.
+    /// cover the whole selector-VISIBLE scope — including `b.rs`, which
+    /// is in-scope but untouched by any edit — while excluding `notes.txt`,
+    /// which is in-scope but not `selector.lang` (controller ruling,
+    /// review round 1: `scope_files` = scope walk ∩ `lang_tag ==
+    /// selector.lang`).
     #[test]
-    fn build_match_populates_files_realpaths_edits_and_a_wider_certificate() {
+    fn build_match_populates_files_realpaths_edits_and_a_lang_filtered_certificate() {
         let d = tempfile::tempdir().unwrap();
         let r = d.path().to_path_buf();
         std::fs::create_dir_all(r.join(".vc")).unwrap();
         std::fs::write(r.join("a.rs"), "fn one() {}\n").unwrap();
         std::fs::write(r.join("b.rs"), "fn two() {}\n").unwrap();
+        std::fs::write(r.join("notes.txt"), "not rust\n").unwrap();
 
         let edit = ResolvedEdit {
             path: PathBuf::from("a.rs"),
@@ -717,6 +759,15 @@ mod tests {
             cert.scope_files.get(&PathBuf::from("b.rs")),
             Some(&crate::hash::bytes_hash(b"fn two() {}\n")),
             "untouched in-scope file must still be covered, read fresh"
+        );
+        assert!(
+            !cert.scope_files.contains_key(&PathBuf::from("notes.txt")),
+            "in-scope but non-selector-lang file must not enter scope_files"
+        );
+        assert_eq!(
+            cert.scope_files.len(),
+            2,
+            "exactly the two selector-visible (lang==rust) files, nothing else"
         );
         assert!(!cert.epoch.is_empty());
         assert_eq!(cert.generation, 1, "first refresh on a fresh .vc dir");
@@ -788,6 +839,198 @@ mod tests {
             std::fs::read_to_string(d.path().join("escape.txt")).unwrap(),
             "one\n",
             "file outside root must be untouched by the refusal"
+        );
+    }
+
+    /// CRITICAL (review round 1): a selector run (e.g. a nested pattern
+    /// match) can hand `build_match` two genuinely overlapping sites in
+    /// the same file. `apply::apply_plan`'s splice loop trusts "edits are
+    /// non-overlapping and sorted" and cannot itself catch a violation, so
+    /// `build_match` must refuse before ever storing the plan.
+    #[test]
+    fn build_match_refuses_overlapping_edits_in_the_same_file() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().to_path_buf();
+        std::fs::create_dir_all(r.join(".vc")).unwrap();
+        std::fs::write(r.join("a.rs"), "abcdef").unwrap();
+
+        let outer = ResolvedEdit {
+            path: PathBuf::from("a.rs"),
+            start: 0,
+            end: 4,
+            old_b64: base64e(b"abcd"),
+            new_b64: base64e(b"1"),
+        };
+        let inner = ResolvedEdit {
+            path: PathBuf::from("a.rs"),
+            start: 2,
+            end: 6,
+            old_b64: base64e(b"cdef"),
+            new_b64: base64e(b"2"),
+        };
+        let content_by_path: BTreeMap<PathBuf, Vec<u8>> =
+            [(PathBuf::from("a.rs"), b"abcdef".to_vec())]
+                .into_iter()
+                .collect();
+
+        let err = Plan::build_match(
+            &r,
+            sample_selector(vec![]),
+            vec![outer, inner],
+            &content_by_path,
+        )
+        .unwrap_err();
+        assert!(matches!(err.kind, crate::ErrorKind::Overlap));
+    }
+
+    /// The sort half of the same invariant: edits handed to `build_match`
+    /// out of order must come back sorted by `(path, start)` — the same
+    /// order `apply::apply_plan`'s splice loop requires.
+    #[test]
+    fn build_match_sorts_out_of_order_edits_by_path_then_start() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().to_path_buf();
+        std::fs::create_dir_all(r.join(".vc")).unwrap();
+        std::fs::write(r.join("a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
+
+        let second = ResolvedEdit {
+            path: PathBuf::from("a.rs"),
+            start: 15,
+            end: 18,
+            old_b64: base64e(b"two"),
+            new_b64: base64e(b"dos"),
+        };
+        let first = ResolvedEdit {
+            path: PathBuf::from("a.rs"),
+            start: 3,
+            end: 6,
+            old_b64: base64e(b"one"),
+            new_b64: base64e(b"uno"),
+        };
+        let content_by_path: BTreeMap<PathBuf, Vec<u8>> = [(
+            PathBuf::from("a.rs"),
+            b"fn one() {}\nfn two() {}\n".to_vec(),
+        )]
+        .into_iter()
+        .collect();
+
+        // Handed in out of order (second-in-file first).
+        let p = Plan::build_match(
+            &r,
+            sample_selector(vec![]),
+            vec![second.clone(), first.clone()],
+            &content_by_path,
+        )
+        .unwrap();
+
+        assert_eq!(p.edits.len(), 2);
+        assert_eq!(
+            p.edits[0].start, first.start,
+            "earlier span comes back first"
+        );
+        assert_eq!(p.edits[1].start, second.start);
+    }
+
+    /// FOLDED MINOR 4 (review round 1): `content_by_path` crosses a public
+    /// API boundary — a caller that forgets a named file's bytes must get
+    /// a `Usage` refusal naming the path, not a panic.
+    #[test]
+    fn build_match_refuses_an_edit_with_no_matching_content_entry() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().to_path_buf();
+        std::fs::create_dir_all(r.join(".vc")).unwrap();
+        std::fs::write(r.join("a.rs"), "fn one() {}\n").unwrap();
+
+        let edit = ResolvedEdit {
+            path: PathBuf::from("a.rs"),
+            start: 3,
+            end: 6,
+            old_b64: base64e(b"one"),
+            new_b64: base64e(b"uno"),
+        };
+        let content_by_path: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new(); // no entry for a.rs
+
+        let err = Plan::build_match(&r, sample_selector(vec![]), vec![edit], &content_by_path)
+            .unwrap_err();
+        assert!(matches!(err.kind, crate::ErrorKind::Usage));
+        assert!(err.message.contains("a.rs"));
+    }
+
+    /// FOLDED MINOR 2 (review round 1): a match-form plan must round-trip
+    /// through `Plan::store`/`Plan::load` exactly like an edit-form plan
+    /// does — the content-addressed integrity check must pass end-to-end
+    /// on the new form, not just on the old one.
+    #[test]
+    fn build_match_plan_store_load_roundtrips_and_passes_integrity() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().to_path_buf();
+        std::fs::create_dir_all(r.join(".vc")).unwrap();
+        std::fs::write(r.join("a.rs"), "fn one() {}\n").unwrap();
+
+        let edit = ResolvedEdit {
+            path: PathBuf::from("a.rs"),
+            start: 3,
+            end: 6,
+            old_b64: base64e(b"one"),
+            new_b64: base64e(b"uno"),
+        };
+        let content_by_path: BTreeMap<PathBuf, Vec<u8>> =
+            [(PathBuf::from("a.rs"), b"fn one() {}\n".to_vec())]
+                .into_iter()
+                .collect();
+
+        let p =
+            Plan::build_match(&r, sample_selector(vec![]), vec![edit], &content_by_path).unwrap();
+        let sha8 = p.store(&r).unwrap();
+        let loaded = Plan::load(&r, &sha8).unwrap();
+
+        assert_eq!(loaded.id(), p.id());
+        assert_eq!(loaded.form, PlanForm::Match);
+        assert!(loaded.selector.is_some());
+        assert!(loaded.certificate.is_some());
+    }
+
+    /// FOLDED MINOR 1 (review round 1): the digest must cover the new
+    /// fields the same way it covers every other field — mutating
+    /// `selector.pattern` or a single `certificate.scope_files` entry must
+    /// change `id()`.
+    #[test]
+    fn digest_covers_selector_and_certificate_fields() {
+        let selector = sample_selector(vec![]);
+        let certificate = ProvenanceCert {
+            epoch: "e".repeat(64),
+            generation: 1,
+            scope_files: [(PathBuf::from("a.rs"), "h".repeat(64))]
+                .into_iter()
+                .collect(),
+        };
+        let mut base = sample_plan();
+        base.version = 2;
+        base.form = PlanForm::Match;
+        base.selector = Some(selector);
+        base.certificate = Some(certificate);
+
+        let baseline_id = base.id();
+
+        let mut mutated_selector = base.clone();
+        mutated_selector.selector.as_mut().unwrap().pattern = "different($$$X)".to_string();
+        assert_ne!(
+            mutated_selector.id(),
+            baseline_id,
+            "selector.pattern must be covered by the digest"
+        );
+
+        let mut mutated_cert = base.clone();
+        mutated_cert
+            .certificate
+            .as_mut()
+            .unwrap()
+            .scope_files
+            .insert(PathBuf::from("a.rs"), "z".repeat(64));
+        assert_ne!(
+            mutated_cert.id(),
+            baseline_id,
+            "a single scope_files entry must be covered by the digest"
         );
     }
 
