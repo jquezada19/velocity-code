@@ -13,3 +13,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo test -p velocity-code-cli --features fault-injection --test crash_consistency
+      - run: sudo apt-get update && sudo apt-get install -y ripgrep jq
+      - run: cargo build --release
+      - name: R1 lexical parity
+        run: PATH="$PWD/target/release:$PATH" harness/r/r1_lexical.sh

@@ -1,0 +1,36 @@
+L	alpha
+L	beta
+L	gamma
+L	Widget
+L	fn new(name
+L	Widget { name:
+L	import os
+L	self.name
+L	class Widget
+L	def alpha(x)
+L	ZEROSTART
+L	EOFNEEDLE
+L	dup dup dup
+L	CRLFNEEDLE
+L	UNIWORD
+L	café
+L	日本語
+L	🎉
+L	Alpha
+L	SECRETVALUE
+L	PLACEHOLDERTOKEN
+L	alpha before
+L	second line
+L	{
+R	fn \w+\(
+R	def \w+\(
+R	struct \w+
+R	class \w+
+R	\balpha\b
+R	[A-Z]{4,}
+R	\d+
+R	(alpha|beta|gamma)
+R	\w*NEEDLE\w*
+R	dup( dup)+
+R	(café|résumé|日本語)
+R	Widget \{

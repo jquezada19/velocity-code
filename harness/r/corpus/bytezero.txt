@@ -1,0 +1,2 @@
+ZEROSTART rest of the line
+second line

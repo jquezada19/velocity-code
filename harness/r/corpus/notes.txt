@@ -1,0 +1,3 @@
+Plain text notes about alpha and beta.
+Second line mentions gamma only.
+Third line has alpha again for good measure.
