@@ -58,6 +58,14 @@ enum Cmd {
         #[arg(long)]
         history: bool,
     },
+    Query {
+        pattern: String,
+        #[arg(long)]
+        regex: bool,
+        #[arg(long)]
+        budget: Option<usize>,
+        paths: Vec<std::path::PathBuf>,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -92,6 +100,7 @@ fn verb_name(cmd: &Cmd) -> &'static str {
         Cmd::Status => "status",
         Cmd::Doctor { .. } => "doctor",
         Cmd::Gain { .. } => "gain",
+        Cmd::Query { .. } => "query",
     }
 }
 
@@ -104,6 +113,12 @@ fn dispatch(root: &Path, cwd: &Path, cmd: &Cmd) -> VcResult<CmdOutcome> {
         Cmd::Status => cmd_status(root),
         Cmd::Doctor { rollback, discard } => cmd_doctor(root, *rollback, *discard),
         Cmd::Gain { history } => cmd_gain(root, *history),
+        Cmd::Query {
+            pattern,
+            regex,
+            budget,
+            paths,
+        } => cmd_query(root, cwd, pattern, *regex, *budget, paths),
     }
 }
 
@@ -386,6 +401,90 @@ fn cmd_gain(root: &Path, history: bool) -> VcResult<CmdOutcome> {
         files: 0,
         edits: 0,
         epoch8: String::new(),
+        warning: None,
+    })
+}
+
+/// `vc query <PATTERN> [--regex] [--budget N] [paths…]` — read-only search,
+/// never touches a user file. `paths` (empty = whole tree) are rebased
+/// per-argument through the same [`rebase_user_path`] `plan edit` uses, so
+/// a scope path is interpreted relative to the CWD the same way a `plan
+/// edit` file argument is, and a path escaping `root` refuses the same way
+/// (`Usage`, exit 2). The epoch stamp comes from a fresh
+/// `index::refresh` — unlike `plan`/`apply`, `query` has no stored plan to
+/// read an epoch off, so it takes the live one directly, same source
+/// `vc status` reads. Zero hits is success (exit 0), not an error: an
+/// agent needs to tell "found nothing" apart from "the command failed."
+fn cmd_query(
+    root: &Path,
+    cwd: &Path,
+    pattern: &str,
+    regex: bool,
+    budget: Option<usize>,
+    paths: &[std::path::PathBuf],
+) -> VcResult<CmdOutcome> {
+    let scope = paths
+        .iter()
+        .map(|p| rebase_user_path(root, cwd, p))
+        .collect::<VcResult<Vec<_>>>()?;
+
+    let (_ix, epoch) = index::refresh(root)?;
+    let epoch8 = index::epoch8(&epoch).to_string();
+
+    let hits = if regex {
+        velocity_code_query::search_regex(root, pattern, &scope)?
+    } else {
+        velocity_code_query::search_literal(root, pattern, &scope)?
+    };
+    let n = hits.len();
+    let budgeted = velocity_code_query::render_hits(&hits, budget);
+
+    let mut human = format!("epoch {epoch8} — {n} hits\n");
+    if !budgeted.text.is_empty() {
+        human.push_str(&budgeted.text);
+        human.push('\n');
+    }
+    if budgeted.elided > 0 {
+        human.push_str(&format!("… elided {} hits (budget)\n", budgeted.elided));
+    }
+
+    // `render_hits` walks `hits` front-to-back, greedily including whole
+    // hits until the running token estimate would exceed `budget`, so the
+    // hits it actually rendered into `budgeted.text` are exactly the first
+    // `hits.len() - budgeted.elided` of them — slicing here keeps the
+    // `--json` `hits` array consistent with `elided` (their counts must
+    // sum to the total match count) instead of dumping every match
+    // regardless of budget.
+    let included = n - budgeted.elided;
+    let json_hits: Vec<serde_json::Value> = hits[..included]
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "path": h.path.to_string_lossy(),
+                "line": h.line,
+                "col": h.col,
+                "text": h.line_text,
+            })
+        })
+        .collect();
+    let json = serde_json::json!({
+        "epoch8": epoch8,
+        "hits": json_hits,
+        "elided": budgeted.elided,
+    });
+
+    let files = hits
+        .iter()
+        .map(|h| &h.path)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+
+    Ok(CmdOutcome {
+        human,
+        json,
+        files,
+        edits: n,
+        epoch8,
         warning: None,
     })
 }

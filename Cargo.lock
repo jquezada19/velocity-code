@@ -1008,6 +1008,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "velocity-code-kernel",
+ "velocity-code-query",
  "velocity-code-select",
 ]
 
@@ -1032,6 +1033,7 @@ name = "velocity-code-query"
 version = "0.0.1"
 dependencies = [
  "memchr",
+ "regex",
  "tempfile",
  "velocity-code-kernel",
 ]

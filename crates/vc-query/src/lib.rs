@@ -8,10 +8,11 @@ pub mod render;
 pub use render::{Budgeted, render_hits, tokens_est};
 
 use memchr::{memchr_iter, memmem};
+use regex::bytes::Regex;
 use std::fs;
 use std::path::{Path, PathBuf};
-use velocity_code_kernel::VcResult;
 use velocity_code_kernel::walk::walk_scoped;
+use velocity_code_kernel::{ErrorKind, VcError, VcResult};
 
 /// One literal-search match.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +57,54 @@ pub fn search_literal(root: &Path, needle: &str, scope: &[PathBuf]) -> VcResult<
         let newlines: Vec<usize> = memchr_iter(b'\n', &bytes).collect();
         for pos in memmem::find_iter(&bytes, needle_bytes) {
             let (line, col, line_text) = locate(&bytes, &newlines, pos);
+            hits.push(QueryHit {
+                path: rel.clone(),
+                line,
+                col,
+                line_text,
+            });
+        }
+    }
+
+    hits.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.line.cmp(&b.line))
+            .then(a.col.cmp(&b.col))
+    });
+    Ok(hits)
+}
+
+/// Regex search for `pattern` across the files under `root` named by
+/// `scope` (same semantics as [`search_literal`]'s `scope`). Runs
+/// `regex::bytes::Regex` over the same whole-file buffers, newline index,
+/// and binary-skip heuristic as `search_literal` — one [`QueryHit`] per
+/// match, not per line, so a line with two matches yields two hits (same
+/// as `search_literal`'s `memmem::find_iter`, which also yields
+/// overlap-free non-overlapping matches per occurrence). An invalid
+/// pattern is not a panic or an empty result: `Regex::new`'s own parse
+/// error is wrapped as `ErrorKind::Usage`, so the CLI surfaces it as a
+/// normal refusal (exit 2) instead of crashing. Results are sorted by
+/// `(path, line, col)`, matching `search_literal`.
+pub fn search_regex(root: &Path, pattern: &str, scope: &[PathBuf]) -> VcResult<Vec<QueryHit>> {
+    let re = Regex::new(pattern).map_err(|e| VcError::new(ErrorKind::Usage, e.to_string()))?;
+    let files = walk_scoped(root, scope)?;
+    let mut hits = Vec::new();
+
+    for rel in files {
+        let full = root.join(&rel);
+        let bytes = match fs::read(&full) {
+            Ok(b) => b,
+            // Unreadable (e.g. a broken symlink race) — skip, not fatal.
+            Err(_) => continue,
+        };
+        if is_binary(&bytes) {
+            continue;
+        }
+
+        let newlines: Vec<usize> = memchr_iter(b'\n', &bytes).collect();
+        for m in re.find_iter(&bytes) {
+            let (line, col, line_text) = locate(&bytes, &newlines, m.start());
             hits.push(QueryHit {
                 path: rel.clone(),
                 line,
@@ -137,6 +186,51 @@ mod tests {
         bytes.extend_from_slice(b" more alpha");
         std::fs::write(d.path().join("bin.dat"), &bytes).unwrap();
         let hits = search_literal(d.path(), "alpha", &[]).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn regex_search_finds_alternation_across_files_in_deterministic_order() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.rs"), "fn alpha() {}\n").unwrap();
+        std::fs::write(d.path().join("b.rs"), "fn beta() {}\n").unwrap();
+        let hits = search_regex(d.path(), "fn (alpha|beta)", &[]).unwrap();
+        let got: Vec<(String, usize, usize)> = hits
+            .iter()
+            .map(|h| (h.path.display().to_string(), h.line, h.col))
+            .collect();
+        assert_eq!(got, vec![("a.rs".into(), 1, 1), ("b.rs".into(), 1, 1)]);
+        assert_eq!(hits[0].line_text, "fn alpha() {}");
+        assert_eq!(hits[1].line_text, "fn beta() {}");
+    }
+
+    #[test]
+    fn regex_search_one_hit_per_match_on_a_repeated_pattern() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.rs"), "aa aa\n").unwrap();
+        let hits = search_regex(d.path(), "aa", &[]).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].col, 1);
+        assert_eq!(hits[1].col, 4);
+    }
+
+    #[test]
+    fn invalid_regex_pattern_is_a_usage_error() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.rs"), "fn alpha() {}\n").unwrap();
+        let err = search_regex(d.path(), "(", &[]).unwrap_err();
+        assert_eq!(err.kind, velocity_code_kernel::ErrorKind::Usage);
+        assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn regex_search_skips_binary_files_same_as_literal() {
+        let d = tempfile::tempdir().unwrap();
+        let mut bytes = b"alpha".to_vec();
+        bytes.push(0u8);
+        bytes.extend_from_slice(b" more alpha");
+        std::fs::write(d.path().join("bin.dat"), &bytes).unwrap();
+        let hits = search_regex(d.path(), "alpha", &[]).unwrap();
         assert!(hits.is_empty());
     }
 
