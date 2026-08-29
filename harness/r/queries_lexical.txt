@@ -22,6 +22,8 @@ L	PLACEHOLDERTOKEN
 L	alpha before
 L	second line
 L	{
+L	SUBGENTOKEN
+L	SUBKEPTTOKEN
 R	fn \w+\(
 R	def \w+\(
 R	struct \w+
@@ -34,3 +36,5 @@ R	\w*NEEDLE\w*
 R	dup( dup)+
 R	(café|résumé|日本語)
 R	Widget \{
+R	^fn
+R	\}$

@@ -8,7 +8,7 @@ pub mod render;
 pub use render::{Budgeted, render_hits, tokens_est};
 
 use memchr::{memchr_iter, memmem};
-use regex::bytes::Regex;
+use regex::bytes::RegexBuilder;
 use std::fs;
 use std::path::{Path, PathBuf};
 use velocity_code_kernel::walk::walk_scoped;
@@ -82,12 +82,23 @@ pub fn search_literal(root: &Path, needle: &str, scope: &[PathBuf]) -> VcResult<
 /// match, not per line, so a line with two matches yields two hits (same
 /// as `search_literal`'s `memmem::find_iter`, which also yields
 /// overlap-free non-overlapping matches per occurrence). An invalid
-/// pattern is not a panic or an empty result: `Regex::new`'s own parse
-/// error is wrapped as `ErrorKind::Usage`, so the CLI surfaces it as a
+/// pattern is not a panic or an empty result: `RegexBuilder::build`'s own
+/// parse error is wrapped as `ErrorKind::Usage`, so the CLI surfaces it as a
 /// normal refusal (exit 2) instead of crashing. Results are sorted by
 /// `(path, line, col)`, matching `search_literal`.
+///
+/// Compiled with `.multi_line(true)` (R1 parity ruling, 2026-08-29): rg's
+/// default search mode feeds its regex engine one line at a time, so `^`/`$`
+/// anchor at every line boundary; without multi-line mode, `Regex` over a
+/// whole-file buffer only anchors `^`/`$` at the true start/end of the
+/// file, which is a real, silent divergence from rg on any anchored
+/// pattern. `\A`/`\z` remain available for whole-buffer anchoring when that
+/// is genuinely what's wanted.
 pub fn search_regex(root: &Path, pattern: &str, scope: &[PathBuf]) -> VcResult<Vec<QueryHit>> {
-    let re = Regex::new(pattern).map_err(|e| VcError::new(ErrorKind::Usage, e.to_string()))?;
+    let re = RegexBuilder::new(pattern)
+        .multi_line(true)
+        .build()
+        .map_err(|e| VcError::new(ErrorKind::Usage, e.to_string()))?;
     let files = walk_scoped(root, scope)?;
     let mut hits = Vec::new();
 
@@ -212,6 +223,37 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].col, 1);
         assert_eq!(hits[1].col, 4);
+    }
+
+    /// R1 parity ruling (2026-08-29): `search_regex` must anchor `^`/`$`
+    /// at every line boundary within a file, matching rg's default
+    /// line-oriented search mode — not just at the whole-buffer start/end,
+    /// which is what a bare (non-multi-line) `Regex` over the whole file
+    /// would do. Pins the `.multi_line(true)` behavior directly.
+    #[test]
+    fn regex_search_anchors_per_line_like_rgs_default_mode() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("a.rs"),
+            "fn alpha() {}\nlet x = 1;\nfn beta() {}\n",
+        )
+        .unwrap();
+
+        let starts = search_regex(d.path(), "^fn", &[]).unwrap();
+        let start_lines: Vec<usize> = starts.iter().map(|h| h.line).collect();
+        assert_eq!(
+            start_lines,
+            vec![1, 3],
+            "^ must match at the start of every line, not only the start of the file"
+        );
+
+        let ends = search_regex(d.path(), ";$", &[]).unwrap();
+        let end_lines: Vec<usize> = ends.iter().map(|h| h.line).collect();
+        assert_eq!(
+            end_lines,
+            vec![2],
+            "$ must match at the end of every line, not only the end of the file"
+        );
     }
 
     #[test]

@@ -10,11 +10,27 @@
 #                         by name, everywhere in the tree
 #   --no-ignore-global    vc's WalkBuilder uses .git_global(false) — no
 #                         per-machine ~/.gitignore / core.excludesFile
-#   --ignore-file <corpus>/.vcignore (when present)
-#                         vc registers ".vcignore" as a per-directory custom
-#                         ignore filename via add_custom_ignore_filename;
-#                         the fixture corpus keeps a single root-level
-#                         .vcignore, so a flat --ignore-file is equivalent
+#   --ignore-file=<f>     one per DISCOVERED .vcignore under the corpus
+#   (repeated)            (root AND any subdirectory's, found fresh each run
+#                         via `find "$corpus" -name .vcignore`). vc registers
+#                         ".vcignore" as a per-directory custom ignore
+#                         filename via add_custom_ignore_filename — every
+#                         directory in the walk gets its own, exactly like
+#                         .gitignore. rg has no CLI equivalent of "treat this
+#                         filename as a recursive per-directory ignore file",
+#                         so each discovered .vcignore is passed as its own
+#                         --ignore-file instead; per rg's own docs its
+#                         patterns are matched relative to the CWD (the
+#                         corpus root), not to the ignore file's own
+#                         directory. That would be a real gap for an
+#                         anchored pattern (e.g. "/foo.rs") — this harness's
+#                         fixture only uses bare, unanchored filenames in
+#                         every .vcignore (e.g. "sub_generated.rs"), and a
+#                         bare gitignore-style pattern matches at any depth
+#                         under BOTH interpretations, so the flat --ignore-file
+#                         model and vc's true per-directory recursion agree
+#                         for this corpus. A future .vcignore using an
+#                         anchored pattern would need this reworked.
 #   (no flag)             .gitignore and ripgrep's own .ignore convention are
 #                         both honored by default on both sides — vc's
 #                         WalkBuilder defaults (git_ignore(true), ignore(true))
@@ -23,24 +39,28 @@
 #   (no flag)             binary-file skip (NUL byte in the first chunk) is
 #                         each tool's own default; neither needs -a/--text
 #
-# NOT pinned, deliberately: regex anchors/multiline. vc's search_regex runs
-# `regex::bytes::Regex::find_iter` once over each file's WHOLE byte buffer
-# (no `(?m)`), so `^`/`$` match only at the true start/end of the file. rg's
-# default (non -U) mode feeds the regex engine one line at a time, so `^`/`$`
-# match at every line boundary. That is a genuine architectural difference,
-# not a bug or a missing flag — R1's query list (queries_lexical.txt) simply
-# contains no anchored regex pattern, so parity here never exercises it.
+# Regex anchors: vc's search_regex compiles with `regex::bytes::RegexBuilder
+# .multi_line(true)` (R1 parity ruling 2026-08-29), so `^`/`$` anchor at
+# every line boundary within a file — matching rg's default line-oriented
+# search mode exactly. queries_lexical.txt includes anchored patterns
+# (`^fn`, `\}$`) to exercise this; there is no known regex-semantics
+# divergence left between vc and rg for this query list.
 set -uo pipefail
 corpus="$(cd "$(dirname "$0")/corpus" && pwd)"
 queries="$(dirname "$0")/queries_lexical.txt"
 
+# One --ignore-file per .vcignore found anywhere under the corpus (root and
+# every subdirectory) — see the flag-rationale block above.
 rg_ignore_args=()
-if [ -f "$corpus/.vcignore" ]; then
-  rg_ignore_args=(--ignore-file="$corpus/.vcignore")
-fi
+while IFS= read -r f; do
+  rg_ignore_args+=("--ignore-file=$f")
+done < <(find "$corpus" -name .vcignore -type f | sort)
 
 fail=0
 n=0
+vc_tmp="$(mktemp)"
+rg_tmp="$(mktemp)"
+trap 'rm -f "$vc_tmp" "$rg_tmp"' EXIT
 
 while IFS=$'\t' read -r mode q || [ -n "$mode" ]; do
   [ -z "$mode" ] && continue
@@ -60,7 +80,22 @@ while IFS=$'\t' read -r mode q || [ -n "$mode" ]; do
     echo "vc error (exit $vc_rc) on query [$mode] $q: $vc_out" >&2
     exit "$vc_rc"
   fi
-  vc_set=$(printf '%s' "$vc_out" | jq -r '.hits[] | "\(.path):\(.line)"' | sort -u)
+
+  # Parse pipeline: check every stage's exit code (PIPESTATUS), not just the
+  # final one — a jq parse error on garbled vc output would otherwise
+  # silently collapse to an empty vc_set that spuriously "matches" an empty
+  # rg_set on any negative-control query (Alpha, SECRETVALUE, ...). Written
+  # against a temp file rather than `x=$(pipeline)` because this bash does
+  # NOT propagate PIPESTATUS through a pipeline run inside a command
+  # substitution — only a bare pipeline (redirected to a file) does.
+  printf '%s' "$vc_out" | jq -r '.hits[] | "\(.path):\(.line)"' | sort -u >"$vc_tmp"
+  vc_pipe=("${PIPESTATUS[@]}") # printf jq sort
+  if [ "${vc_pipe[1]}" -ne 0 ] || [ "${vc_pipe[2]}" -ne 0 ]; then
+    echo "vc parse pipeline failed (jq=${vc_pipe[1]} sort=${vc_pipe[2]}) on query [$mode] $q" >&2
+    echo "raw vc output: $vc_out" >&2
+    exit 1
+  fi
+  vc_set=$(cat "$vc_tmp")
 
   # rg exits 1 for "no match" (expected on the ignored/binary/case-mismatch
   # queries below) and 2 for a real error — only the latter is fatal here.
@@ -76,7 +111,18 @@ while IFS=$'\t' read -r mode q || [ -n "$mode" ]; do
     echo "rg error (exit $rg_rc) on query [$mode] $q: $rg_out" >&2
     exit "$rg_rc"
   fi
-  rg_set=$(printf '%s' "$rg_out" | grep -v '^$' | cut -d: -f1,2 | sort -u)
+
+  # Same PIPESTATUS discipline as the vc side. `grep -v '^$'` legitimately
+  # exits 1 when rg_out was empty (every line filtered out — zero matches is
+  # not an error); only grep exit >1, or any nonzero from cut/sort, is fatal.
+  printf '%s' "$rg_out" | grep -v '^$' | cut -d: -f1,2 | sort -u >"$rg_tmp"
+  rg_pipe=("${PIPESTATUS[@]}") # printf grep cut sort
+  if [ "${rg_pipe[1]}" -gt 1 ] || [ "${rg_pipe[2]}" -ne 0 ] || [ "${rg_pipe[3]}" -ne 0 ]; then
+    echo "rg parse pipeline failed (grep=${rg_pipe[1]} cut=${rg_pipe[2]} sort=${rg_pipe[3]}) on query [$mode] $q" >&2
+    echo "raw rg output: $rg_out" >&2
+    exit 1
+  fi
+  rg_set=$(cat "$rg_tmp")
 
   if ! diff <(echo "$vc_set") <(echo "$rg_set") >/dev/null; then
     echo "R1 MISMATCH [$mode] $q"
