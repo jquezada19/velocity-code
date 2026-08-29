@@ -9,6 +9,7 @@ repository.workspace = true
 memchr.workspace = true
 regex.workspace = true
 velocity-code-kernel = { path = "../vc-kernel" }
+velocity-code-lang = { path = "../vc-lang" }
 
 [dev-dependencies]
 tempfile.workspace = true

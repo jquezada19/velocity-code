@@ -62,6 +62,12 @@ enum Cmd {
         pattern: String,
         #[arg(long)]
         regex: bool,
+        /// Symbol-name search instead of literal/regex content search
+        /// (`vc query NAME --symbol`). Mutually exclusive with `--regex` —
+        /// checked in `cmd_query`, not `clap`, so the refusal routes
+        /// through the normal `VcError`/`--json` envelope.
+        #[arg(long)]
+        symbol: bool,
         #[arg(long)]
         budget: Option<usize>,
         paths: Vec<std::path::PathBuf>,
@@ -116,9 +122,10 @@ fn dispatch(root: &Path, cwd: &Path, cmd: &Cmd) -> VcResult<CmdOutcome> {
         Cmd::Query {
             pattern,
             regex,
+            symbol,
             budget,
             paths,
-        } => cmd_query(root, cwd, pattern, *regex, *budget, paths),
+        } => cmd_query(root, cwd, pattern, *regex, *symbol, *budget, paths),
     }
 }
 
@@ -405,24 +412,38 @@ fn cmd_gain(root: &Path, history: bool) -> VcResult<CmdOutcome> {
     })
 }
 
-/// `vc query <PATTERN> [--regex] [--budget N] [paths…]` — read-only search,
-/// never touches a user file. `paths` (empty = whole tree) are rebased
-/// per-argument through the same [`rebase_user_path`] `plan edit` uses, so
-/// a scope path is interpreted relative to the CWD the same way a `plan
-/// edit` file argument is, and a path escaping `root` refuses the same way
-/// (`Usage`, exit 2). The epoch stamp comes from a fresh
-/// `index::refresh` — unlike `plan`/`apply`, `query` has no stored plan to
-/// read an epoch off, so it takes the live one directly, same source
-/// `vc status` reads. Zero hits is success (exit 0), not an error: an
-/// agent needs to tell "found nothing" apart from "the command failed."
+/// `vc query <PATTERN> [--regex] [--symbol] [--budget N] [paths…]` —
+/// read-only search, never touches a user file. `paths` (empty = whole
+/// tree) are rebased per-argument through the same [`rebase_user_path`]
+/// `plan edit` uses, so a scope path is interpreted relative to the CWD the
+/// same way a `plan edit` file argument is, and a path escaping `root`
+/// refuses the same way (`Usage`, exit 2). The epoch stamp comes from a
+/// fresh `index::refresh` — unlike `plan`/`apply`, `query` has no stored
+/// plan to read an epoch off, so it takes the live one directly, same
+/// source `vc status` reads. Zero hits is success (exit 0), not an error:
+/// an agent needs to tell "found nothing" apart from "the command failed."
+///
+/// `--symbol` switches to name-based symbol search (`velocity_code_query::
+/// search_symbol`) and is mutually exclusive with `--regex` — checked here
+/// (not via `clap`'s `conflicts_with`) so the refusal routes through the
+/// same `VcError`/`--json` envelope as every other error, same pattern as
+/// `cmd_doctor`'s `--rollback`/`--discard` check.
 fn cmd_query(
     root: &Path,
     cwd: &Path,
     pattern: &str,
     regex: bool,
+    symbol: bool,
     budget: Option<usize>,
     paths: &[std::path::PathBuf],
 ) -> VcResult<CmdOutcome> {
+    if symbol && regex {
+        return Err(VcError::new(
+            ErrorKind::Usage,
+            "query: --symbol and --regex are mutually exclusive",
+        ));
+    }
+
     let scope = paths
         .iter()
         .map(|p| rebase_user_path(root, cwd, p))
@@ -430,6 +451,10 @@ fn cmd_query(
 
     let (_ix, epoch) = index::refresh(root)?;
     let epoch8 = index::epoch8(&epoch).to_string();
+
+    if symbol {
+        return cmd_query_symbol(root, pattern, budget, &scope, epoch8);
+    }
 
     let hits = if regex {
         velocity_code_query::search_regex(root, pattern, &scope)?
@@ -486,6 +511,91 @@ fn cmd_query(
         edits: n,
         epoch8,
         warning: None,
+    })
+}
+
+/// `vc query NAME --symbol` handler, split out of [`cmd_query`] because its
+/// hit shape (`SymbolHit`, no `col`/`line_text`) and `--json` shape (adds
+/// `fuzzy`, `kind`/`signature` instead of `col`/`text`, and a per-hit
+/// `fuzzy_source` only in fuzzy mode) genuinely diverge from the literal/
+/// regex path rather than just needing a branch inside it. `epoch8` is
+/// passed in already computed — `cmd_query` takes it from the same
+/// `index::refresh` call both paths need for the header, before branching.
+fn cmd_query_symbol(
+    root: &Path,
+    name: &str,
+    budget: Option<usize>,
+    scope: &[std::path::PathBuf],
+    epoch8: String,
+) -> VcResult<CmdOutcome> {
+    let (hits, fuzzy, warnings) = velocity_code_query::search_symbol(root, name, scope)?;
+    let n = hits.len();
+    let budgeted = velocity_code_query::render_symbol_hits(&hits, budget);
+
+    let mut human = format!("epoch {epoch8} — {n} hits\n");
+    if !budgeted.text.is_empty() {
+        human.push_str(&budgeted.text);
+        human.push('\n');
+    }
+    if budgeted.elided > 0 {
+        human.push_str(&format!("… elided {} hits (budget)\n", budgeted.elided));
+    }
+
+    // Same "included = total - elided, slice the front" reasoning as
+    // cmd_query's literal/regex path: render_symbol_hits walks hits
+    // front-to-back and greedily includes whole hits, so the rendered
+    // text is exactly the first `n - budgeted.elided` of them.
+    let included = n - budgeted.elided;
+    let json_hits: Vec<serde_json::Value> = hits[..included]
+        .iter()
+        .map(|h| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("path".into(), serde_json::json!(h.path.to_string_lossy()));
+            obj.insert("line".into(), serde_json::json!(h.symbol.start_line));
+            obj.insert(
+                "kind".into(),
+                serde_json::json!(velocity_code_query::symbol_kind_label(&h.symbol.kind)),
+            );
+            obj.insert("signature".into(), serde_json::json!(h.symbol.signature));
+            // fuzzy_source is redundant in exact mode (the symbol's name
+            // already equals the query) so it's only emitted when the
+            // match came from the fuzzy substring fallback.
+            if fuzzy {
+                obj.insert("fuzzy_source".into(), serde_json::json!(h.symbol.name));
+            }
+            serde_json::Value::Object(obj)
+        })
+        .collect();
+
+    let json = serde_json::json!({
+        "epoch8": epoch8,
+        "hits": json_hits,
+        "fuzzy": fuzzy,
+        "elided": budgeted.elided,
+    });
+
+    let files = hits
+        .iter()
+        .map(|h| &h.path)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    // Multiple per-file parse warnings collapse into CmdOutcome's single
+    // `warning` slot (the same one apply/undo use for a non-fatal,
+    // surfaced-but-not-failing condition) — joined rather than dropped, so
+    // every skipped file is still visible to the caller.
+    let warning = if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join("; "))
+    };
+
+    Ok(CmdOutcome {
+        human,
+        json,
+        files,
+        edits: n,
+        epoch8,
+        warning,
     })
 }
 

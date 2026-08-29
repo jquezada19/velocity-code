@@ -1045,6 +1045,7 @@ dependencies = [
  "regex",
  "tempfile",
  "velocity-code-kernel",
+ "velocity-code-lang",
 ]
 
 [[package]]

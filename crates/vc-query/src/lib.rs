@@ -5,12 +5,13 @@
 //! working tree or the `.vc` store.
 
 pub mod render;
-pub use render::{Budgeted, render_hits, tokens_est};
+pub use render::{Budgeted, render_hits, render_symbol_hits, symbol_kind_label, tokens_est};
 
 use memchr::{memchr_iter, memmem};
 use regex::bytes::RegexBuilder;
 use std::fs;
 use std::path::{Path, PathBuf};
+use velocity_code_kernel::index;
 use velocity_code_kernel::walk::walk_scoped;
 use velocity_code_kernel::{ErrorKind, VcError, VcResult};
 
@@ -132,6 +133,107 @@ pub fn search_regex(root: &Path, pattern: &str, scope: &[PathBuf]) -> VcResult<V
             .then(a.col.cmp(&b.col))
     });
     Ok(hits)
+}
+
+/// One symbol-search match: a parsed [`velocity_code_lang::Symbol`] plus the
+/// root-relative file it came from.
+#[derive(Debug, Clone)]
+pub struct SymbolHit {
+    /// Root-relative path of the file the symbol was parsed from.
+    pub path: PathBuf,
+    pub symbol: velocity_code_lang::Symbol,
+}
+
+/// Languages `search_symbol` knows how to parse today — checked against
+/// each file's *index* `lang` tag (never the extension recomputed
+/// on-the-fly), so a `.txt` file is never handed to a language parser no
+/// matter what its content looks like. Growing this list to track
+/// `vc_lang::symbols`'s coverage (Python arrives in PR B) is a one-line
+/// change here.
+const SYMBOL_LANGS: &[&str] = &["rust"];
+
+/// Symbol search for `name` across the files under `root` named by `scope`
+/// (same semantics as [`search_literal`]'s `scope`).
+///
+/// Refreshes the stat index first (so it sees any file the caller just
+/// touched) and only parses files whose *index* `lang` tag is in
+/// [`SYMBOL_LANGS`]. A file whose `vc_lang::symbols` call errors
+/// (`ErrorKind::Malformed` — genuinely unparseable, non-blank source) is
+/// skipped, not fatal: its root-relative path plus the error message is
+/// appended to the returned warnings instead of aborting the whole search.
+/// An unreadable or non-UTF8 file is likewise skipped silently, matching
+/// `search_literal`/`search_regex`'s existing "unreadable -> skip" policy.
+///
+/// Two-tier match: an exact-name match (`symbol.name == name`) wins over a
+/// case-insensitive substring match of `name` within `symbol.name` (fuzzy
+/// is name-only — this crate never fuzzes content search). If any exact
+/// matches exist, only those are returned and the `bool` is `false`;
+/// otherwise every case-insensitive substring match is returned and the
+/// `bool` is `true`. Either tier is sorted by `(path, start_line)`.
+///
+/// Returns `(hits, fuzzy, warnings)` — a 3-tuple rather than a bare `Vec`
+/// or an out-param — because the CLI needs all three from one call: the
+/// `fuzzy` flag drives `--json`'s top-level `fuzzy` field and whether each
+/// hit gets a `fuzzy_source`, and `warnings` (joined) fills the same
+/// `CmdOutcome.warning` slot `apply`/`undo` already use for a non-fatal,
+/// surfaced-but-not-failing condition — an out-param would need the same
+/// plumbing with more ceremony for no extra clarity at this call site.
+pub fn search_symbol(
+    root: &Path,
+    name: &str,
+    scope: &[PathBuf],
+) -> VcResult<(Vec<SymbolHit>, bool, Vec<String>)> {
+    let (ix, _epoch) = index::refresh(root)?;
+    let name_lower = name.to_lowercase();
+    let mut exact = Vec::new();
+    let mut fuzzy_pool = Vec::new();
+    let mut warnings = Vec::new();
+
+    for (rel, entry) in &ix.entries {
+        if !SYMBOL_LANGS.contains(&entry.lang.as_str()) {
+            continue;
+        }
+        if !scope.is_empty() && !scope.iter().any(|s| rel.starts_with(s)) {
+            continue;
+        }
+        let full = root.join(rel);
+        let src = match fs::read_to_string(&full) {
+            Ok(s) => s,
+            // Unreadable or non-UTF8 (e.g. a broken symlink race) — skip,
+            // not fatal, same policy as search_literal/search_regex.
+            Err(_) => continue,
+        };
+        let syms = match velocity_code_lang::symbols(&src, &entry.lang) {
+            Ok(s) => s,
+            Err(e) => {
+                warnings.push(format!("{}: {}", rel.display(), e.message));
+                continue;
+            }
+        };
+        for sym in syms {
+            if sym.name == name {
+                exact.push(SymbolHit {
+                    path: rel.clone(),
+                    symbol: sym,
+                });
+            } else if sym.name.to_lowercase().contains(&name_lower) {
+                fuzzy_pool.push(SymbolHit {
+                    path: rel.clone(),
+                    symbol: sym,
+                });
+            }
+        }
+    }
+
+    let sort_key = |h: &SymbolHit| (h.path.clone(), h.symbol.start_line);
+    exact.sort_by_key(sort_key);
+    fuzzy_pool.sort_by_key(sort_key);
+
+    if !exact.is_empty() {
+        Ok((exact, false, warnings))
+    } else {
+        Ok((fuzzy_pool, true, warnings))
+    }
 }
 
 fn is_binary(bytes: &[u8]) -> bool {
@@ -298,5 +400,90 @@ mod tests {
         let budgeted = render_hits(&hits, Some(budget));
         assert_eq!(budgeted.text, three_lines_text);
         assert_eq!(budgeted.elided, 97);
+    }
+
+    #[test]
+    fn exact_name_match_wins_over_fuzzy_substring_matches() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.rs"), "fn id() {}\nfn identify() {}\n").unwrap();
+        let (hits, fuzzy, warnings) = search_symbol(d.path(), "id", &[]).unwrap();
+        assert!(warnings.is_empty());
+        assert!(!fuzzy, "an exact match must not be reported as fuzzy");
+        let names: Vec<&str> = hits.iter().map(|h| h.symbol.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["id"],
+            "the fuzzy-only 'identify' hit must not leak into an exact-tier result"
+        );
+    }
+
+    #[test]
+    fn fuzzy_substring_match_used_and_flagged_when_no_exact_name_matches() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.rs"), "fn identify() {}\nfn other() {}\n").unwrap();
+        let (hits, fuzzy, warnings) = search_symbol(d.path(), "id", &[]).unwrap();
+        assert!(warnings.is_empty());
+        assert!(
+            fuzzy,
+            "zero exact matches must fall back to fuzzy, flagged true"
+        );
+        let names: Vec<&str> = hits.iter().map(|h| h.symbol.name.as_str()).collect();
+        assert_eq!(names, vec!["identify"]);
+    }
+
+    #[test]
+    fn malformed_file_is_skipped_with_warning_not_fatal() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("good.rs"), "fn target() {}\n").unwrap();
+        std::fs::write(
+            d.path().join("bad.rs"),
+            "this is not rust code at all, just prose.",
+        )
+        .unwrap();
+        let (hits, fuzzy, warnings) = search_symbol(d.path(), "target", &[]).unwrap();
+        assert!(!fuzzy);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].symbol.name, "target");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "a malformed file must produce a warning, not fail the whole search"
+        );
+        assert!(warnings[0].contains("bad.rs"), "got: {:?}", warnings);
+    }
+
+    #[test]
+    fn unsupported_language_files_are_never_parsed() {
+        let d = tempfile::tempdir().unwrap();
+        // Content that would itself be flagged Malformed if fed to the
+        // rust parser (see the vc-lang unit test using the same string) —
+        // asserting zero warnings here proves the .txt file was never
+        // even attempted, not merely attempted-and-swallowed.
+        std::fs::write(
+            d.path().join("notes.txt"),
+            "this is not rust code at all, just prose.",
+        )
+        .unwrap();
+        let (hits, _fuzzy, warnings) = search_symbol(d.path(), "prose", &[]).unwrap();
+        assert!(hits.is_empty());
+        assert!(
+            warnings.is_empty(),
+            "a non-indexed-as-rust file must not even be attempted: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn hits_within_a_tier_are_ordered_by_path_then_start_line() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("b.rs"), "fn dup() {}\n").unwrap();
+        std::fs::write(d.path().join("a.rs"), "fn other() {}\nfn dup() {}\n").unwrap();
+        let (hits, fuzzy, _) = search_symbol(d.path(), "dup", &[]).unwrap();
+        assert!(!fuzzy);
+        let got: Vec<(String, usize)> = hits
+            .iter()
+            .map(|h| (h.path.display().to_string(), h.symbol.start_line))
+            .collect();
+        assert_eq!(got, vec![("a.rs".into(), 2), ("b.rs".into(), 1)]);
     }
 }
