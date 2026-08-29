@@ -95,6 +95,16 @@ pub struct Plan {
     /// Match-form only; same skip-when-absent contract as `selector`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certificate: Option<ProvenanceCert>,
+    /// Match-form only: the matcher's own warnings (files skipped without
+    /// failing the run — not UTF-8, or an unparseable/error-recovered
+    /// tree; see `velocity_code_select::match_sites`). Stored ON the plan
+    /// (controller ruling, Task 13) rather than surfaced only as a
+    /// transient CLI stderr line — the plan is the permanent record of
+    /// what its selector saw, and a file it silently skipped belongs in
+    /// that record. Empty on every edit/import plan and never serialized
+    /// then — same id-stability contract as `selector`/`certificate`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 fn plans_dir(root: &Path) -> PathBuf {
@@ -179,6 +189,7 @@ impl Plan {
             created_unix,
             selector: None,
             certificate: None,
+            warnings: Vec::new(),
         })
     }
 
@@ -199,11 +210,17 @@ impl Plan {
     /// This is strictly wider than `edits`' file set, since scope can
     /// (and typically does) include files the selector looked at but
     /// didn't match.
+    ///
+    /// `warnings` are the matcher's own per-file skip warnings (Task 13
+    /// controller ruling) — stored verbatim on the returned `Plan` so
+    /// `vc show` can print them and the plan stays the permanent record
+    /// of what its selector saw, including what it silently skipped.
     pub fn build_match(
         root: &Path,
         selector: MatchSelector,
         mut edits: Vec<ResolvedEdit>,
         content_by_path: &BTreeMap<PathBuf, Vec<u8>>,
+        warnings: Vec<String>,
     ) -> VcResult<Plan> {
         let root_real = root
             .canonicalize()
@@ -310,6 +327,7 @@ impl Plan {
             created_unix,
             selector: Some(selector),
             certificate: Some(certificate),
+            warnings,
         })
     }
 
@@ -444,6 +462,7 @@ mod tests {
             created_unix: 1_756_400_000,
             selector: None,
             certificate: None,
+            warnings: Vec::new(),
         }
     }
 
@@ -508,6 +527,10 @@ mod tests {
         let json = serde_json::to_string(&sample_plan()).unwrap();
         assert!(!json.contains("selector"), "None fields must not serialize");
         assert!(!json.contains("certificate"));
+        assert!(
+            !json.contains("warnings"),
+            "empty warnings must not serialize"
+        );
     }
 
     /// The stronger half of the regression: a literal M1-era plan JSON
@@ -727,8 +750,14 @@ mod tests {
                 .collect();
         let selector = sample_selector(vec![]);
 
-        let p =
-            Plan::build_match(&r, selector.clone(), vec![edit.clone()], &content_by_path).unwrap();
+        let p = Plan::build_match(
+            &r,
+            selector.clone(),
+            vec![edit.clone()],
+            &content_by_path,
+            Vec::new(),
+        )
+        .unwrap();
 
         assert_eq!(p.version, 2);
         assert_eq!(p.form, PlanForm::Match);
@@ -802,7 +831,7 @@ mod tests {
                 .collect();
         let selector = sample_selector(vec![PathBuf::from("sub")]);
 
-        let p = Plan::build_match(&r, selector, vec![edit], &content_by_path).unwrap();
+        let p = Plan::build_match(&r, selector, vec![edit], &content_by_path, Vec::new()).unwrap();
         let cert = p.certificate.unwrap();
         assert!(cert.scope_files.contains_key(&PathBuf::from("sub/a.rs")));
         assert!(
@@ -832,8 +861,14 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        let err = Plan::build_match(&r, sample_selector(vec![]), vec![edit], &content_by_path)
-            .unwrap_err();
+        let err = Plan::build_match(
+            &r,
+            sample_selector(vec![]),
+            vec![edit],
+            &content_by_path,
+            Vec::new(),
+        )
+        .unwrap_err();
         assert!(matches!(err.kind, crate::ErrorKind::Usage));
         assert_eq!(
             std::fs::read_to_string(d.path().join("escape.txt")).unwrap(),
@@ -878,6 +913,7 @@ mod tests {
             sample_selector(vec![]),
             vec![outer, inner],
             &content_by_path,
+            Vec::new(),
         )
         .unwrap_err();
         assert!(matches!(err.kind, crate::ErrorKind::Overlap));
@@ -920,6 +956,7 @@ mod tests {
             sample_selector(vec![]),
             vec![second.clone(), first.clone()],
             &content_by_path,
+            Vec::new(),
         )
         .unwrap();
 
@@ -950,8 +987,14 @@ mod tests {
         };
         let content_by_path: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new(); // no entry for a.rs
 
-        let err = Plan::build_match(&r, sample_selector(vec![]), vec![edit], &content_by_path)
-            .unwrap_err();
+        let err = Plan::build_match(
+            &r,
+            sample_selector(vec![]),
+            vec![edit],
+            &content_by_path,
+            Vec::new(),
+        )
+        .unwrap_err();
         assert!(matches!(err.kind, crate::ErrorKind::Usage));
         assert!(err.message.contains("a.rs"));
     }
@@ -979,8 +1022,14 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        let p =
-            Plan::build_match(&r, sample_selector(vec![]), vec![edit], &content_by_path).unwrap();
+        let p = Plan::build_match(
+            &r,
+            sample_selector(vec![]),
+            vec![edit],
+            &content_by_path,
+            vec!["b.rs: skipped — source did not parse as rust".to_string()],
+        )
+        .unwrap();
         let sha8 = p.store(&r).unwrap();
         let loaded = Plan::load(&r, &sha8).unwrap();
 
@@ -988,6 +1037,45 @@ mod tests {
         assert_eq!(loaded.form, PlanForm::Match);
         assert!(loaded.selector.is_some());
         assert!(loaded.certificate.is_some());
+        assert_eq!(loaded.warnings, p.warnings, "warnings must round-trip too");
+        assert_eq!(loaded.warnings.len(), 1);
+    }
+
+    /// Warnings-empty case gets the same skip-serializing-if-empty
+    /// treatment as `selector`/`certificate` on a match-form plan too
+    /// (not just the edit-form case `edit_form_plan_serialization_is_
+    /// byte_identical_to_m1_shape` pins) — a match plan the matcher found
+    /// nothing to warn about must not carry a stray `"warnings":[]` key.
+    #[test]
+    fn build_match_with_no_warnings_does_not_serialize_the_key() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().to_path_buf();
+        std::fs::create_dir_all(r.join(".vc")).unwrap();
+        std::fs::write(r.join("a.rs"), "fn one() {}\n").unwrap();
+
+        let edit = ResolvedEdit {
+            path: PathBuf::from("a.rs"),
+            start: 3,
+            end: 6,
+            old_b64: base64e(b"one"),
+            new_b64: base64e(b"uno"),
+        };
+        let content_by_path: BTreeMap<PathBuf, Vec<u8>> =
+            [(PathBuf::from("a.rs"), b"fn one() {}\n".to_vec())]
+                .into_iter()
+                .collect();
+
+        let p = Plan::build_match(
+            &r,
+            sample_selector(vec![]),
+            vec![edit],
+            &content_by_path,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(p.warnings.is_empty());
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("warnings"));
     }
 
     /// FOLDED MINOR 1 (review round 1): the digest must cover the new

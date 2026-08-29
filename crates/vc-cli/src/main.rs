@@ -16,12 +16,12 @@ use std::io::Read as _;
 use std::path::Path;
 use velocity_code_kernel::{
     ErrorKind, VcError, VcResult, lang_tag,
-    plan::{Plan, PlanForm, b64d},
+    plan::{MatchSelector, Plan, PlanForm, ResolvedEdit, b64d, b64e},
     recover::{self, DoctorAction},
     resolve::EditRequest,
-    {apply, index, root},
+    {apply, index, root, walk},
 };
-use velocity_code_select::{edits_from_args, edits_from_diff};
+use velocity_code_select::{edits_from_args, edits_from_diff, match_sites};
 
 #[derive(clap::Parser)]
 #[command(name = "vc", version)]
@@ -102,15 +102,40 @@ enum PlanCmd {
     },
     /// Reads a unified diff from stdin.
     Import,
-    /// Re-resolve a stored plan's edits against CURRENT file content and
-    /// store the result as a new plan. This is what a `Stale` apply
-    /// refusal's `next:` hint points at (I3): the old plan's edits are
-    /// still exactly what was asked for, only the file has moved on since
-    /// it was made, so refresh re-runs the same resolution fresh rather
-    /// than asking the caller to redo the whole `plan edit`/`plan import`
-    /// from scratch. If the old text no longer exists (or is now
-    /// ambiguous), the ordinary resolve error surfaces — that's correct:
-    /// refresh does not paper over an edit that no longer applies.
+    /// Structural match-and-rewrite plan: `--pattern`/`--rewrite` over
+    /// `paths` (empty = whole tree, rebased against the CWD the same way
+    /// `plan edit`'s `file` argument is). `--lang` pins the language;
+    /// omitted, it's auto-detected from the scope — exactly one supported
+    /// language present is used, a mix refuses naming it, none refuses
+    /// naming the scope (see [`plan_match_pipeline`]). `--expect N`
+    /// refuses (`Usage`, exit 2, nothing stored) unless the matcher finds
+    /// exactly N sites.
+    Match {
+        #[arg(long)]
+        pattern: String,
+        #[arg(long)]
+        rewrite: String,
+        #[arg(long)]
+        lang: Option<String>,
+        #[arg(long)]
+        expect: Option<usize>,
+        paths: Vec<std::path::PathBuf>,
+    },
+    /// Re-resolve a stored plan against CURRENT file content and store the
+    /// result as a new plan. This is what a `Stale` apply refusal's
+    /// `next:` hint points at (I3): the old plan's edits are still exactly
+    /// what was asked for, only the file has moved on since it was made,
+    /// so refresh re-runs the same resolution fresh rather than asking the
+    /// caller to redo the whole `plan edit`/`plan import`/`plan match`
+    /// from scratch. For an edit/import plan this replays the stored
+    /// edits' old/new text against current content; for a match plan
+    /// (`selector: Some(_)`) this instead re-runs the FULL match pipeline
+    /// from the stored selector — fresh walk, fresh match — since the
+    /// stored edits alone can't reflect a call site that only exists in
+    /// the current tree (spec §11b, uniform refresh across all three plan
+    /// forms). If the old text no longer exists (or is now ambiguous), the
+    /// ordinary resolve error surfaces — that's correct: refresh does not
+    /// paper over an edit that no longer applies.
     Refresh { sha8: String },
 }
 
@@ -209,16 +234,17 @@ fn rebase_user_path(root: &Path, cwd: &Path, user_path: &Path) -> VcResult<std::
         .map_err(|_| VcError::new(ErrorKind::Usage, "path outside repo root"))
 }
 
-/// `vc plan edit`/`vc plan import` -> resolve, digest, store. R1 (ledger
+/// `vc plan edit`/`vc plan import`/`vc plan match` -> resolve, digest,
+/// store; `vc plan refresh` re-derives one of the three fresh. R1 (ledger
 /// ruling): `edit` takes exactly one `--old`/`--new` pair per invocation;
 /// a multi-edit plan goes through `import` in M1, repeatable `edit` pairs
 /// are M2 polish.
 fn cmd_plan(root: &Path, cwd: &Path, form: &PlanCmd) -> VcResult<CmdOutcome> {
-    let (plan_form, reqs) = match form {
+    let plan = match form {
         PlanCmd::Edit { file, old, new } => {
             let rel = rebase_user_path(root, cwd, file)?;
             let reqs = edits_from_args(&[(rel, old.clone(), new.clone())]);
-            (PlanForm::Edit, reqs)
+            Plan::build(root, PlanForm::Edit, &reqs)?
         }
         PlanCmd::Import => {
             // Diff-internal paths are NOT rebased against cwd — see
@@ -228,27 +254,59 @@ fn cmd_plan(root: &Path, cwd: &Path, form: &PlanCmd) -> VcResult<CmdOutcome> {
             let mut diff_text = String::new();
             std::io::stdin().read_to_string(&mut diff_text)?;
             let reqs = edits_from_diff(&diff_text)?;
-            (PlanForm::Import, reqs)
+            Plan::build(root, PlanForm::Import, &reqs)?
+        }
+        PlanCmd::Match {
+            pattern,
+            rewrite,
+            lang,
+            expect,
+            paths,
+        } => {
+            let scope = paths
+                .iter()
+                .map(|p| rebase_user_path(root, cwd, p))
+                .collect::<VcResult<Vec<_>>>()?;
+            plan_match_pipeline(root, &scope, lang.as_deref(), pattern, rewrite, *expect)?
         }
         PlanCmd::Refresh { sha8 } => {
             let stale_plan = Plan::load(root, sha8)?;
-            let reqs = stale_plan
-                .edits
-                .iter()
-                .map(|e| {
-                    Ok(EditRequest {
-                        path: e.path.clone(),
-                        old: b64d(&e.old_b64)?,
-                        new: b64d(&e.new_b64)?,
-                        line_hint: None,
-                    })
-                })
-                .collect::<VcResult<Vec<EditRequest>>>()?;
-            (stale_plan.form, reqs)
+            match &stale_plan.selector {
+                // Match-form: re-run the FULL pipeline from the stored
+                // selector (fresh walk, fresh match) instead of replaying
+                // stored edits — the stored edits alone can't surface a
+                // call site that only exists in the CURRENT tree. No
+                // `--expect` on a refresh: the whole point is to accept
+                // whatever the current tree now yields.
+                Some(sel) => plan_match_pipeline(
+                    root,
+                    &sel.paths,
+                    Some(sel.lang.as_str()),
+                    &sel.pattern,
+                    &sel.rewrite,
+                    None,
+                )?,
+                // Edit/import-form: unchanged M1 behavior — re-resolve the
+                // stored old/new text against current content.
+                None => {
+                    let reqs = stale_plan
+                        .edits
+                        .iter()
+                        .map(|e| {
+                            Ok(EditRequest {
+                                path: e.path.clone(),
+                                old: b64d(&e.old_b64)?,
+                                new: b64d(&e.new_b64)?,
+                                line_hint: None,
+                            })
+                        })
+                        .collect::<VcResult<Vec<EditRequest>>>()?;
+                    Plan::build(root, stale_plan.form, &reqs)?
+                }
+            }
         }
     };
 
-    let plan = Plan::build(root, plan_form, &reqs)?;
     let sha8 = plan.store(root)?;
     let sites = plan.edits.len();
     let files = plan.files.len();
@@ -263,14 +321,147 @@ fn cmd_plan(root: &Path, cwd: &Path, form: &PlanCmd) -> VcResult<CmdOutcome> {
         "files": files,
         "epoch8": epoch8,
     });
+    // Match-form only (`plan.warnings` is always empty on edit/import) —
+    // same "join with '; ', print once via the existing CmdOutcome.warning
+    // stderr line" convention `apply`/`undo`/`query --symbol`/`read
+    // --symbol` already use for their own non-fatal warnings.
+    let warning = if plan.warnings.is_empty() {
+        None
+    } else {
+        Some(plan.warnings.join("; "))
+    };
     Ok(CmdOutcome {
         human,
         json,
         files,
         edits: sites,
         epoch8,
-        warning: None,
+        warning,
     })
+}
+
+/// Fixed priority for the mixed-language refusal message, so `vc plan
+/// match`'s auto-detect names the mix in a stable, deterministic order
+/// (`"rust+python"`) rather than whatever order a set iterates in.
+/// Extending `lang_tag` with a new language just needs a new arm here.
+fn lang_priority(lang: &str) -> u8 {
+    match lang {
+        "rust" => 0,
+        "python" => 1,
+        _ => 2,
+    }
+}
+
+/// Render a `plan match` scope for an error message: `.` for the whole
+/// tree (empty `paths`), else the given paths joined for display.
+fn describe_scope(paths: &[std::path::PathBuf]) -> String {
+    if paths.is_empty() {
+        ".".to_string()
+    } else {
+        paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The full `vc plan match` pipeline, shared by `PlanCmd::Match` (fresh
+/// `--pattern`/`--rewrite`/scope, `lang` auto-detected unless `--lang` was
+/// given, `expect` checked before anything is stored) and
+/// `PlanCmd::Refresh`'s match-form path (`sel.paths`/`sel.lang`/
+/// `sel.pattern`/`sel.rewrite` from the stored selector, `expect: None`) —
+/// refresh re-runs this exact pipeline rather than replaying stored edits,
+/// so a refreshed match plan reflects BOTH current file content and
+/// current scope membership, uniformly with a fresh `plan match` (spec
+/// §11b).
+///
+/// `lang` — `Some` pins the language outright (an explicit `--lang`, or a
+/// refresh's `sel.lang`); `None` auto-detects from the walked scope's
+/// `lang_tag`s: exactly one distinct supported language present -> use it;
+/// more than one -> `Usage` naming the mix (`"scope spans rust+python —
+/// pass --lang"`); none -> `Usage` naming the scope. Returns a fully built
+/// (not yet stored) `Plan` — the caller stores it and reports; on an
+/// `--expect` mismatch, nothing is built or stored at all.
+fn plan_match_pipeline(
+    root: &Path,
+    scope_paths: &[std::path::PathBuf],
+    lang: Option<&str>,
+    pattern: &str,
+    rewrite: &str,
+    expect: Option<usize>,
+) -> VcResult<Plan> {
+    let walked = walk::walk_scoped(root, scope_paths)?;
+
+    let lang = match lang {
+        Some(l) => l.to_string(),
+        None => {
+            let mut langs: Vec<&str> = walked
+                .iter()
+                .map(|p| lang_tag(p))
+                .filter(|l| !l.is_empty())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            langs.sort_by_key(|l| lang_priority(l));
+            match langs.len() {
+                0 => {
+                    return Err(VcError::new(
+                        ErrorKind::Usage,
+                        format!(
+                            "{}: scope has no supported language — nothing to match",
+                            describe_scope(scope_paths)
+                        ),
+                    ));
+                }
+                1 => langs[0].to_string(),
+                _ => {
+                    return Err(VcError::new(
+                        ErrorKind::Usage,
+                        format!("scope spans {} — pass --lang", langs.join("+")),
+                    ));
+                }
+            }
+        }
+    };
+
+    let scope_files: Vec<std::path::PathBuf> =
+        walked.into_iter().filter(|p| lang_tag(p) == lang).collect();
+
+    let (sites, content_by_path, warnings) =
+        match_sites(root, pattern, rewrite, &lang, &scope_files)?;
+
+    if let Some(n) = expect
+        && n != sites.len()
+    {
+        return Err(VcError::new(
+            ErrorKind::Usage,
+            format!(
+                "expected {n} sites, found {} — plan not stored",
+                sites.len()
+            ),
+        ));
+    }
+
+    let edits: Vec<ResolvedEdit> = sites
+        .into_iter()
+        .map(|s| ResolvedEdit {
+            path: s.path,
+            start: s.start,
+            end: s.end,
+            old_b64: b64e(&s.old),
+            new_b64: b64e(&s.new),
+        })
+        .collect();
+
+    let selector = MatchSelector {
+        pattern: pattern.to_string(),
+        rewrite: rewrite.to_string(),
+        lang,
+        paths: scope_paths.to_vec(),
+    };
+
+    Plan::build_match(root, selector, edits, &content_by_path, warnings)
 }
 
 /// `vc show <sha8>` — full diff preview of a stored plan. The spec pins
@@ -285,12 +476,24 @@ fn cmd_show(root: &Path, sha8: &str) -> VcResult<CmdOutcome> {
     let edits = plan.edits.len();
     let epoch8 = index::epoch8(&plan.epoch).to_string();
 
+    // Match-form only (`plan.warnings` is always empty on edit/import):
+    // one `warning: {w}` line per matcher warning, appended after the
+    // preview — stored on the plan itself (Task 13 controller ruling), so
+    // `vc show` on an OLD plan still reports exactly what its selector
+    // skipped, not just whatever the `plan match` invocation's own stderr
+    // happened to print at the time.
+    let mut human = preview.clone();
+    for w in &plan.warnings {
+        human.push_str(&format!("warning: {w}\n"));
+    }
+
     let json = serde_json::json!({
         "sha8": sha8_full,
         "preview": preview,
+        "warnings": plan.warnings,
     });
     Ok(CmdOutcome {
-        human: preview,
+        human,
         json,
         files,
         edits,
