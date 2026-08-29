@@ -2,9 +2,88 @@ use std::path::PathBuf;
 use velocity_code_kernel::resolve::EditRequest;
 use velocity_code_kernel::{ErrorKind, VcError};
 
+/// Parse one `@@`-header side (`-<start>[,<len>]` or `+<start>[,<len>]`,
+/// with the leading `-`/`+` already stripped by the caller) into
+/// `(start, len)`. A missing `,<len>` defaults to 1, per unified-diff
+/// convention (a header never omits `,1` in practice, but the grammar
+/// allows it).
+fn parse_start_len(s: &str) -> Option<(usize, usize)> {
+    let mut it = s.split(',');
+    let start: usize = it.next()?.parse().ok()?;
+    let len: usize = match it.next() {
+        Some(l) => l.parse().ok()?,
+        None => 1,
+    };
+    Some((start, len))
+}
+
+/// Consume exactly the body lines a hunk header promises, by count — never
+/// by pattern-matching a body line's own text. A hunk header `@@
+/// -old_start,old_len +new_start,new_len @@` promises exactly `old_len`
+/// old-side lines (context + deletions) and `new_len` new-side lines
+/// (context + additions); inside that counted window every ` `/`-`/`+`
+/// prefix is consumed unconditionally, so a deleted line whose own text
+/// starts with `--` (e.g. `--x`) or an added line whose own text starts
+/// with `++` (e.g. `++i;`) can never be mistaken for a `---`/`+++` file
+/// header — there is no prefix special-casing left to fool. Once both
+/// counts are satisfied, the window closes immediately (no greedy
+/// over-read); running out of input, or a line with any other leading
+/// byte, before the counts are satisfied is a zero-fuzz `Malformed`
+/// refusal rather than a silently-truncated hunk.
+fn consume_counted_hunk_body(
+    lines: &mut std::str::Lines<'_>,
+    old_len: usize,
+    new_len: usize,
+    mal: impl Fn(&str) -> VcError,
+) -> Result<(Vec<u8>, Vec<u8>), VcError> {
+    let (mut old, mut new) = (Vec::new(), Vec::new());
+    let (mut old_count, mut new_count) = (0usize, 0usize);
+    while old_count < old_len || new_count < new_len {
+        let body = lines
+            .next()
+            .ok_or_else(|| mal("hunk ended before header counts were satisfied"))?;
+        match body.as_bytes().first() {
+            Some(b' ') => {
+                if old_count >= old_len || new_count >= new_len {
+                    return Err(mal("hunk has more context lines than its header counts"));
+                }
+                old.extend_from_slice(&body.as_bytes()[1..]);
+                old.push(b'\n');
+                new.extend_from_slice(&body.as_bytes()[1..]);
+                new.push(b'\n');
+                old_count += 1;
+                new_count += 1;
+            }
+            Some(b'-') => {
+                if old_count >= old_len {
+                    return Err(mal("hunk has more '-' lines than its header's old count"));
+                }
+                old.extend_from_slice(&body.as_bytes()[1..]);
+                old.push(b'\n');
+                old_count += 1;
+            }
+            Some(b'+') => {
+                if new_count >= new_len {
+                    return Err(mal("hunk has more '+' lines than its header's new count"));
+                }
+                new.extend_from_slice(&body.as_bytes()[1..]);
+                new.push(b'\n');
+                new_count += 1;
+            }
+            Some(b'\\') => {
+                return Err(mal(
+                    "'\\ No newline' markers unsupported in v0.1 — refused, not fuzzed",
+                ));
+            }
+            _ => return Err(mal("hunk ended before header counts were satisfied")),
+        }
+    }
+    Ok((old, new))
+}
+
 pub fn edits_from_diff(diff_text: &str) -> Result<Vec<EditRequest>, VcError> {
     let mut out = Vec::new();
-    let mut lines = diff_text.lines().peekable();
+    let mut lines = diff_text.lines();
     let mut cur_path: Option<PathBuf> = None;
     let mal = |m: &str| VcError::new(ErrorKind::Malformed, format!("diff: {m}"));
 
@@ -21,42 +100,22 @@ pub fn edits_from_diff(diff_text: &str) -> Result<Vec<EditRequest>, VcError> {
             let path = cur_path
                 .clone()
                 .ok_or_else(|| mal("hunk before file header"))?;
-            // parse "-<start>[,<len>] +<start>[,<len>] @@"
-            let old_start: usize = hdr
-                .split_whitespace()
+            // "-<old_start>[,<old_len>] +<new_start>[,<new_len>] @@"
+            let mut sides = hdr.split_whitespace();
+            let old_side = sides
                 .next()
                 .and_then(|s| s.strip_prefix('-'))
-                .and_then(|s| s.split(',').next())
-                .and_then(|s| s.parse().ok())
                 .ok_or_else(|| mal("bad hunk header"))?;
-            let (mut old, mut new) = (Vec::new(), Vec::new());
-            while let Some(&body) = lines.peek() {
-                match body.as_bytes().first() {
-                    Some(b' ') => {
-                        old.extend_from_slice(&body.as_bytes()[1..]);
-                        old.push(b'\n');
-                        new.extend_from_slice(&body.as_bytes()[1..]);
-                        new.push(b'\n');
-                        lines.next();
-                    }
-                    Some(b'-') if !body.starts_with("---") => {
-                        old.extend_from_slice(&body.as_bytes()[1..]);
-                        old.push(b'\n');
-                        lines.next();
-                    }
-                    Some(b'+') if !body.starts_with("+++") => {
-                        new.extend_from_slice(&body.as_bytes()[1..]);
-                        new.push(b'\n');
-                        lines.next();
-                    }
-                    Some(b'\\') => {
-                        return Err(mal(
-                            "'\\ No newline' markers unsupported in v0.1 — refused, not fuzzed",
-                        ));
-                    }
-                    _ => break,
-                }
-            }
+            let new_side = sides
+                .next()
+                .and_then(|s| s.strip_prefix('+'))
+                .ok_or_else(|| mal("bad hunk header"))?;
+            let (old_start, old_len) =
+                parse_start_len(old_side).ok_or_else(|| mal("bad hunk header"))?;
+            let (_new_start, new_len) =
+                parse_start_len(new_side).ok_or_else(|| mal("bad hunk header"))?;
+
+            let (old, new) = consume_counted_hunk_body(&mut lines, old_len, new_len, mal)?;
             if old.is_empty() && new.is_empty() {
                 return Err(mal("empty hunk"));
             }
@@ -68,8 +127,16 @@ pub fn edits_from_diff(diff_text: &str) -> Result<Vec<EditRequest>, VcError> {
             });
         } else if line.starts_with("diff ") || line.starts_with("index ") || line.is_empty() {
             continue; // tolerated git-diff furniture
-        } else if out.is_empty() && cur_path.is_none() {
-            return Err(mal("not a unified diff"));
+        } else {
+            // Anything here is neither a new file header, a new hunk
+            // header, nor tolerated furniture — including a stray line
+            // left over after a hunk's counted window has already closed.
+            // Silently ignoring it was the other half of the C1 bug (an
+            // orphaned line swallowed with no error); zero-fuzz refusal
+            // instead.
+            return Err(mal(
+                "expected a hunk header, a file header, or diff furniture",
+            ));
         }
     }
     if out.is_empty() {
@@ -142,5 +209,106 @@ mod tests {
         let reqs = edits_from_diff(diff).unwrap();
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[1].line_hint, Some(10));
+    }
+
+    /// C1 regression (a): a hunk that deletes a body line whose own text
+    /// starts with `--` (e.g. a Lua/SQL comment `--x`) renders in the diff
+    /// as `---x` (the `-` deletion marker plus the literal `--x`) — which
+    /// must NOT be mistaken for a `---` file header mid-hunk. Length-count
+    /// the hunk from its `@@ -1,2 +1,1 @@` header instead of pattern-
+    /// matching the body line's prefix, and the deleted line survives
+    /// intact in `old` rather than being silently dropped.
+    #[test]
+    fn hunk_deleting_a_line_that_starts_with_dashdash_is_not_truncated() {
+        let diff = "\
+--- a/comment.lua
++++ b/comment.lua
+@@ -1,2 +1,1 @@
+ keep
+---x
+";
+        let reqs = edits_from_diff(diff).unwrap();
+        assert_eq!(reqs.len(), 1);
+        let r = &reqs[0];
+        assert_eq!(
+            r.old,
+            b"keep\n--x\n".to_vec(),
+            "deleted '--x' line must survive"
+        );
+        assert_eq!(r.new, b"keep\n".to_vec());
+    }
+
+    /// C1 regression (b): symmetric case on the `+` side — adding a line
+    /// whose own text starts with `+` (e.g. C's `++i;`) renders as `+++i;`
+    /// and must not be mistaken for a `+++` file header mid-hunk.
+    #[test]
+    fn hunk_adding_a_line_that_starts_with_plusplus_is_not_truncated() {
+        let diff = "\
+--- a/loop.c
++++ b/loop.c
+@@ -1,1 +1,2 @@
+ keep
++++i;
+";
+        let reqs = edits_from_diff(diff).unwrap();
+        assert_eq!(reqs.len(), 1);
+        let r = &reqs[0];
+        assert_eq!(r.old, b"keep\n".to_vec());
+        assert_eq!(
+            r.new,
+            b"keep\n++i;\n".to_vec(),
+            "added '++i;' line must survive"
+        );
+    }
+
+    /// C1 regression (c): the header claims 3 old lines but the body only
+    /// supplies 2 before the diff runs out — zero-fuzz refusal, not a
+    /// best-effort partial parse.
+    #[test]
+    fn hunk_header_count_exceeding_body_lines_is_malformed() {
+        let diff = "\
+--- a/x.txt
++++ b/x.txt
+@@ -1,3 +1,3 @@
+ a
+-b
++B
+";
+        let e = edits_from_diff(diff).unwrap_err();
+        assert!(matches!(e.kind, velocity_code_kernel::ErrorKind::Malformed));
+    }
+
+    /// A stray, unrecognized line between hunks (not a new `@@` header, not
+    /// a new `---` file header, not tolerated furniture) must refuse
+    /// instead of being silently ignored — the general form of the C1 bug.
+    #[test]
+    fn unrecognized_line_after_a_hunk_closes_is_malformed() {
+        let diff = "\
+--- a/x.txt
++++ b/x.txt
+@@ -1,1 +1,1 @@
+-a
++A
+this line is not a header or furniture
+";
+        let e = edits_from_diff(diff).unwrap_err();
+        assert!(matches!(e.kind, velocity_code_kernel::ErrorKind::Malformed));
+    }
+
+    /// Missing `,len` on a header side defaults to 1, per unified-diff
+    /// convention.
+    #[test]
+    fn header_without_explicit_len_defaults_to_one() {
+        let diff = "\
+--- a/x.txt
++++ b/x.txt
+@@ -1 +1 @@
+-a
++A
+";
+        let reqs = edits_from_diff(diff).unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].old, b"a\n".to_vec());
+        assert_eq!(reqs[0].new, b"A\n".to_vec());
     }
 }

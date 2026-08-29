@@ -198,6 +198,69 @@ fn json_shape_for_clean_apply_and_undo() {
     assert!(v["warning"].is_null());
 }
 
+/// C1 regression (a), end-to-end: a diff deleting a Lua/SQL comment line
+/// `--x` must actually remove it, not silently no-op. Before the fix, the
+/// hunk's body-line prefix check (`!body.starts_with("---")`) broke out of
+/// the hunk the instant it hit the `---x` line (the `-` marker plus the
+/// literal `--x` text), so `old` and `new` both ended up as just `keep\n`
+/// — a no-op edit that resolves and applies cleanly against the real file
+/// without ever touching the `--x` line.
+#[test]
+fn plan_import_deleting_dashdash_line_actually_removes_it() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("comment.lua"), "keep\n--x\n").unwrap();
+    let diff = "--- a/comment.lua\n+++ b/comment.lua\n@@ -1,2 +1,1 @@\n keep\n---x\n";
+
+    let out = vc(r)
+        .args(["--json", "plan", "import"])
+        .write_stdin(diff)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let sha8 = serde_json::from_slice::<serde_json::Value>(&out).unwrap()["sha8"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    vc(r).args(["apply", &sha8]).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(r.join("comment.lua")).unwrap(),
+        "keep\n",
+        "the '--x' line must actually be deleted, not silently kept"
+    );
+}
+
+/// C1 regression (b), end-to-end: a diff adding C's `++i;` must actually
+/// add it. Symmetric to the deletion case above, on the `+` side.
+#[test]
+fn plan_import_adding_plusplus_line_actually_adds_it() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("loop.c"), "keep\n").unwrap();
+    let diff = "--- a/loop.c\n+++ b/loop.c\n@@ -1,1 +1,2 @@\n keep\n+++i;\n";
+
+    let out = vc(r)
+        .args(["--json", "plan", "import"])
+        .write_stdin(diff)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let sha8 = serde_json::from_slice::<serde_json::Value>(&out).unwrap()["sha8"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    vc(r).args(["apply", &sha8]).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(r.join("loop.c")).unwrap(),
+        "keep\n++i;\n",
+        "the '++i;' line must actually be added, not silently dropped"
+    );
+}
+
 /// Own test: `gain` on a repo with no `.vc/metrics/` at all (nothing has
 /// ever run) succeeds with an empty aggregate rather than erroring.
 #[test]
