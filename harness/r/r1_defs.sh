@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
-# R1 definitions: top-1 symbol-search accuracy against a frozen, hand-labeled
-# Rust corpus (harness/r/corpus_defs/), same bash+jq shape as r1_lexical.sh.
+# R1 definitions: top-1 symbol-search accuracy against a frozen,
+# hand-authored Rust corpus (harness/r/corpus_defs/), same bash+jq shape as
+# r1_lexical.sh.
+#
+# Labels were derived from the extractor's documented rules and cross-checked
+# against vc's own output; tie-break rows — a bare name shared by more than
+# one definition — are resolved to vc's documented (path, line) ordering,
+# since only the first can ever be top-1 for that name. That makes this a
+# regression detector against a pinned, documented behaviour rather than a
+# validation against an independent oracle. Full provenance, including which
+# rows are tie-breaks: r1_defs/PROVENANCE.md.
 #
 # For every ground-truth row, `vc query NAME --symbol --json`'s FIRST hit
 # (hits[0] — search_symbol sorts exact matches by (path, start_line), so

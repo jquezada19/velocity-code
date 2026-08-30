@@ -179,7 +179,10 @@ named set); it never authorizes a write the kernel would otherwise refuse.
 - A file that fails to parse, isn't valid UTF-8, can't be read, or is
   larger than the 16 MiB content-search limit is skipped **with a warning,
   never silently** — in every search mode, `query` and `query --regex`
-  included. Dogfooding this on vc's own repo, `vc query Plan --symbol`
+  included. The one deliberate exception is **binary files, which are
+  skipped silently, exactly as ripgrep does**: a NUL byte in the first
+  8 KiB marks a file binary, and a warning per PNG would bury the
+  diagnostics that matter. Dogfooding this on vc's own repo, `vc query Plan --symbol`
   surfaced `warning: harness/r/corpus/sub/sub_kept.rs: rust: source did
   not parse` on stderr for real, live — that file is one of R1's own
   fixtures. `vc plan match` warnings from the same code path aren't
@@ -227,6 +230,10 @@ walk is identical on every machine.
 R1 (spec §6) pins both read-verb ground truths as CI gates, reproducible
 locally: `harness/r/r1_lexical.sh` (parity with `rg` over
 `harness/r/corpus/`, needs a real `rg` binary + `jq`) and
-`harness/r/r1_defs.sh` (`vc query --symbol` top-1 accuracy ≥ 98% against the
-hand-labeled `harness/r/corpus_defs/`, needs `jq`; a release build of `vc` on
-`PATH` for both).
+`harness/r/r1_defs.sh` (`vc query --symbol` top-1 accuracy ≥ 98% against
+`harness/r/corpus_defs/` — a hand-authored corpus whose labels were
+derived from the extractor's documented rules and cross-checked against
+`vc`'s own output, with tie-break rows resolved to `vc`'s documented
+`(path, line)` ordering; needs `jq`; a release build of `vc` on `PATH` for
+both). Exactly how those labels were produced, and what they therefore do
+and do not prove, is `harness/r/r1_defs/PROVENANCE.md`.

@@ -610,6 +610,13 @@ mod tests {
         assert_eq!(paths, vec!["kept.rs".to_string()]);
     }
 
+    /// A binary file is the ONE silent skip, by ruling (2026-08-29) —
+    /// rg-equivalent behaviour, and a warning per PNG would bury the
+    /// diagnostics that matter. So `warnings.is_empty()` here is the
+    /// assertion the design wants, not a gap in the "never silently
+    /// skipped" claim: that claim covers unreadable, unparseable and
+    /// oversized files, and the README states the binary exception
+    /// explicitly.
     #[test]
     fn binary_files_are_skipped() {
         let d = tempfile::tempdir().unwrap();
