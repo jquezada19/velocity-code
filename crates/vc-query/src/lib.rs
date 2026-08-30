@@ -50,6 +50,64 @@ const BINARY_SNIFF_LEN: usize = 8192;
 /// answer, and the caller has to be able to see it.
 const MAX_SEARCH_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Longest `line_text` a [`QueryHit`] will carry, in bytes of the source
+/// line. A hit past this is rendered as a window CENTERED on the match
+/// column, with a `…` marker appended.
+///
+/// Every hit clones its whole matched line. On a file with one enormous
+/// line — minified JS, a single-row CSV, a base64 blob — a short needle
+/// therefore costs (matches × line length), which is quadratic in the
+/// line and is paid BEFORE `--budget` can trim anything, since the budget
+/// only applies at render time. A 4 MB minified bundle with a few
+/// thousand hits was measured at 993 MB. Clamping makes each hit's text
+/// cost a constant.
+///
+/// `line`/`col` are NOT affected: they are computed from the file's real
+/// newline index and always name the true position in the true line. The
+/// R1 lexical parity gate compares `(path, line)` sets only — its jq is
+/// `.hits[] | "\(.path):\(.line)"`, and r1_defs reads `.fuzzy` plus
+/// `.hits[0].path`/`.line` — so no gate reads `text` and parity is
+/// unaffected by this clamp.
+const MAX_LINE_TEXT_BYTES: usize = 500;
+
+/// Largest number of hits a single search will materialize. Past this,
+/// the search REFUSES (`Usage`) rather than returning a partial answer:
+/// the hit vector is built in full before `--budget` sees it, so an
+/// unbounded match count is an out-of-memory shape, and silently
+/// truncating it would hand back an answer that looks complete and is
+/// not. Fail closed — the caller narrows the pattern and asks again.
+const MAX_TOTAL_HITS: usize = 100_000;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for [`MAX_TOTAL_HITS`], so the cap refusal can be
+    /// exercised with a handful of matches instead of a hundred thousand.
+    /// Thread-local (not a global) because the search runs on the calling
+    /// thread and Rust's test harness runs tests in parallel.
+    static HIT_CAP_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+fn hit_cap() -> usize {
+    #[cfg(test)]
+    if let Some(n) = HIT_CAP_OVERRIDE.with(|c| c.get()) {
+        return n;
+    }
+    MAX_TOTAL_HITS
+}
+
+/// Refuse once the accumulated hit count passes [`hit_cap`]. Called after
+/// every push, so the vector never grows more than one hit past the cap.
+fn refuse_if_over_hit_cap(n: usize) -> VcResult<()> {
+    let cap = hit_cap();
+    if n > cap {
+        return Err(
+            VcError::new(ErrorKind::Usage, format!("too many hits (>{cap})"))
+                .with_next("narrow the pattern, or pass a scope path: vc query <pattern> <paths…>"),
+        );
+    }
+    Ok(())
+}
+
 /// Read one candidate for content search, bounded at both ends.
 ///
 /// Returns `None` when the file must be skipped, pushing an explanatory
@@ -167,6 +225,7 @@ pub fn search_literal(
                 col,
                 line_text,
             });
+            refuse_if_over_hit_cap(hits.len())?;
         }
     }
 
@@ -238,6 +297,7 @@ pub fn search_regex(
                 col,
                 line_text,
             });
+            refuse_if_over_hit_cap(hits.len())?;
         }
     }
 
@@ -412,6 +472,10 @@ pub fn search_ast(
 /// Maps a byte offset within `bytes` to `(1-based line, 1-based byte col,
 /// line text without trailing newline)`, given `newlines` — the sorted
 /// byte offsets of every `\n` in `bytes`.
+///
+/// The returned text is clamped to [`MAX_LINE_TEXT_BYTES`] (see there for
+/// why) — a window centered on the match, `…`-marked. `line` and `col`
+/// are always the true position in the true, unclamped line.
 fn locate(bytes: &[u8], newlines: &[usize], pos: usize) -> (usize, usize, String) {
     let line_idx = newlines.partition_point(|&nl| nl < pos);
     let line_start = if line_idx == 0 {
@@ -421,8 +485,47 @@ fn locate(bytes: &[u8], newlines: &[usize], pos: usize) -> (usize, usize, String
     };
     let line_end = newlines.get(line_idx).copied().unwrap_or(bytes.len());
     let col = pos - line_start + 1;
-    let line_text = String::from_utf8_lossy(&bytes[line_start..line_end]).into_owned();
+    let (window, clamped) = clamp_line_window(&bytes[line_start..line_end], pos - line_start);
+    let mut line_text = String::from_utf8_lossy(window).into_owned();
+    if clamped {
+        line_text.push('…');
+    }
     (line_idx + 1, col, line_text)
+}
+
+/// A byte is a UTF-8 sequence boundary unless it is a continuation byte
+/// (`10xxxxxx`). Used on raw, possibly-invalid bytes, where
+/// `str::is_char_boundary` is unavailable — cutting mid-sequence would
+/// turn an intact multi-byte character into replacement characters purely
+/// because of where the window happened to land.
+fn is_utf8_boundary(b: u8) -> bool {
+    (b & 0xC0) != 0x80
+}
+
+/// The window of `line` to show for a match at byte offset `match_off`
+/// within it, plus whether anything was cut.
+///
+/// A line at or under [`MAX_LINE_TEXT_BYTES`] is returned whole. Longer,
+/// the window is centered on the match (so the match itself is visible
+/// even at the far end of a megabyte-long line), pushed back inside the
+/// line at either edge, then shrunk to UTF-8 sequence boundaries.
+fn clamp_line_window(line: &[u8], match_off: usize) -> (&[u8], bool) {
+    if line.len() <= MAX_LINE_TEXT_BYTES {
+        return (line, false);
+    }
+    let half = MAX_LINE_TEXT_BYTES / 2;
+    let mut start = match_off.saturating_sub(half);
+    let mut end = (start + MAX_LINE_TEXT_BYTES).min(line.len());
+    // Reclaim the width lost when the window ran off the end of the line.
+    start = end.saturating_sub(MAX_LINE_TEXT_BYTES);
+
+    while start < end && !is_utf8_boundary(line[start]) {
+        start += 1;
+    }
+    while end > start && end < line.len() && !is_utf8_boundary(line[end]) {
+        end -= 1;
+    }
+    (&line[start..end], true)
 }
 
 #[cfg(test)]
@@ -571,6 +674,118 @@ mod tests {
         let budgeted = render_hits(&hits, Some(budget));
         assert_eq!(budgeted.text, three_lines_text);
         assert_eq!(budgeted.elided, 97);
+    }
+
+    /// Set the hit cap for the duration of `f` on this thread.
+    fn with_hit_cap<T>(cap: usize, f: impl FnOnce() -> T) -> T {
+        HIT_CAP_OVERRIDE.with(|c| c.set(Some(cap)));
+        let out = f();
+        HIT_CAP_OVERRIDE.with(|c| c.set(None));
+        out
+    }
+
+    /// A single very long line — the minified-bundle shape — must not
+    /// make every hit carry a copy of the whole line. The text is clamped
+    /// and marked, while `line`/`col` still name the true position.
+    #[test]
+    fn a_hit_on_a_very_long_line_clamps_its_text_and_marks_it() {
+        let d = tempfile::tempdir().unwrap();
+        // 2000 bytes of filler, the needle at a known offset, more filler.
+        let prefix = "x".repeat(1000);
+        let suffix = "y".repeat(1000);
+        let line = format!("{prefix}NEEDLE{suffix}");
+        assert!(line.len() > MAX_LINE_TEXT_BYTES);
+        std::fs::write(d.path().join("min.js"), format!("{line}\n")).unwrap();
+
+        let (hits, _) = search_literal(d.path(), "NEEDLE", &[]).unwrap();
+        assert_eq!(hits.len(), 1);
+        let h = &hits[0];
+
+        // Position is exact, and unaffected by the clamp.
+        assert_eq!(h.line, 1);
+        assert_eq!(h.col, 1001, "col is the true 1-based byte column");
+
+        // Text is clamped to the window plus the marker, and still shows
+        // the match itself.
+        assert!(h.line_text.ends_with('…'), "clamped text is marked");
+        assert!(
+            h.line_text.contains("NEEDLE"),
+            "the window is centered on the match, so the match is visible"
+        );
+        assert!(
+            h.line_text.len() <= MAX_LINE_TEXT_BYTES + '…'.len_utf8(),
+            "clamped to {MAX_LINE_TEXT_BYTES} bytes + marker, got {}",
+            h.line_text.len()
+        );
+
+        // The control: a short line is returned whole, unmarked.
+        std::fs::write(d.path().join("short.rs"), "let NEEDLE = 1;\n").unwrap();
+        let (hits, _) = search_literal(d.path(), "let NEEDLE", &[]).unwrap();
+        assert_eq!(hits[0].line_text, "let NEEDLE = 1;");
+    }
+
+    /// The clamp must not cut a multi-byte character in half — doing so
+    /// would turn intact text into replacement characters purely because
+    /// of where the window landed.
+    #[test]
+    fn the_clamp_window_never_splits_a_multibyte_character() {
+        let d = tempfile::tempdir().unwrap();
+        // Every filler character is 3 bytes, so a naive byte window would
+        // land mid-sequence for most match offsets.
+        let filler = "あ".repeat(400);
+        std::fs::write(
+            d.path().join("wide.txt"),
+            format!("{filler}NEEDLE{filler}\n"),
+        )
+        .unwrap();
+
+        let (hits, _) = search_literal(d.path(), "NEEDLE", &[]).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            !hits[0].line_text.contains('\u{FFFD}'),
+            "no replacement characters: {}",
+            hits[0].line_text
+        );
+        assert!(hits[0].line_text.contains("NEEDLE"));
+    }
+
+    /// Past the cap the search REFUSES rather than returning a partial
+    /// answer — fail closed. Exercised through the test-only cap override
+    /// so the fixture stays small; the production cap is 100_000.
+    #[test]
+    fn a_search_past_the_hit_cap_refuses_instead_of_answering_partially() {
+        let d = tempfile::tempdir().unwrap();
+        let mut content = String::new();
+        for _ in 0..20 {
+            content.push_str("tok\n");
+        }
+        std::fs::write(d.path().join("many.rs"), content).unwrap();
+
+        for regex in [false, true] {
+            let err = with_hit_cap(5, || {
+                if regex {
+                    search_regex(d.path(), "tok", &[]).unwrap_err()
+                } else {
+                    search_literal(d.path(), "tok", &[]).unwrap_err()
+                }
+            });
+            assert_eq!(
+                err.kind,
+                velocity_code_kernel::ErrorKind::Usage,
+                "regex={regex}"
+            );
+            assert!(
+                err.message.contains("too many hits (>5)"),
+                "regex={regex}: {}",
+                err.message
+            );
+            assert!(err.next.is_some(), "regex={regex}: refusal needs a hint");
+        }
+
+        // The control: exactly at the cap is still an answer, not a
+        // refusal — the refusal fires on EXCEEDING it.
+        let (hits, _) = with_hit_cap(20, || search_literal(d.path(), "tok", &[]).unwrap());
+        assert_eq!(hits.len(), 20);
     }
 
     /// An empty literal needle matches at every byte position, so the hit

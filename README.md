@@ -190,7 +190,16 @@ named set); it never authorizes a write the kernel would otherwise refuse.
 - An empty pattern is refused, not answered. `vc query ""` — and any
   `--regex` pattern that matches the empty string, like `a*` — has a match
   at every byte position in the tree, which is an out-of-memory shape
-  rather than an answer. Both refuse `usage:` (exit 2).
+  rather than an answer. Both refuse `usage:` (exit 2). A search that
+  would produce more than **100,000 hits** refuses the same way (`usage:
+  too many hits (>100000)`, exit 2): the hit list is built in full before
+  `--budget` can trim it, and silently returning the first N would look
+  like a complete answer without being one.
+- A hit's reported text is clamped to **500 bytes**, as a window centered
+  on the match with a `…` marker — a minified bundle or a single-row CSV
+  is one enormous line, and a copy of it per hit is quadratic. The
+  reported `line` and `col` are always the true position in the true,
+  unclamped line.
 
 ## Exit codes
 
