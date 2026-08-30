@@ -471,6 +471,32 @@ fn infer_scope_lang(
     Ok((lang, scope_files))
 }
 
+/// Every file in `files` that is larger than
+/// [`velocity_code_query::MAX_SEARCH_FILE_BYTES`], as `(path, len)`.
+///
+/// `velocity_code_select::match_sites` reads each scope file whole and
+/// RETAINS every buffer — that retention is correct and deliberate (the
+/// query-provenance certificate must be hashed from the bytes the match
+/// pass itself read, not a second read), which is exactly why the size
+/// gate cannot live inside the matcher. It lives at each caller, which
+/// can decide the right policy for its own verb.
+///
+/// A file that cannot be stat'd is NOT reported here: this function only
+/// answers "is it too big", and a missing or unreadable file is the
+/// matcher's own error to raise, with its own message.
+fn oversized_scope_files(
+    root: &Path,
+    files: &[std::path::PathBuf],
+) -> Vec<(std::path::PathBuf, u64)> {
+    files
+        .iter()
+        .filter_map(|rel| {
+            let len = std::fs::metadata(root.join(rel)).ok()?.len();
+            (len > velocity_code_query::MAX_SEARCH_FILE_BYTES).then(|| (rel.clone(), len))
+        })
+        .collect()
+}
+
 fn plan_match_pipeline(
     root: &Path,
     scope_paths: &[std::path::PathBuf],
@@ -480,6 +506,31 @@ fn plan_match_pipeline(
     expect: Option<usize>,
 ) -> VcResult<Plan> {
     let (lang, scope_files) = infer_scope_lang(root, scope_paths, lang)?;
+
+    // An oversized file in scope REFUSES here — it is not skipped. The
+    // plan's certificate has to cover every file the selector could see
+    // (that is what makes the apply-time scope-drift check meaningful), so
+    // a file quietly dropped from the match pass would be a hole in the
+    // certificate: the drift check would never notice a site appearing in
+    // it. `vc query --ast` can skip-with-a-warning because a query has no
+    // certificate to keep honest; `plan match` cannot, so refusing is the
+    // only sound option. The caller's way out is to put the file outside
+    // the selector's attention (`.vcignore`) or outside its scope.
+    if let Some((rel, len)) = oversized_scope_files(root, &scope_files).first() {
+        let cap = velocity_code_query::MAX_SEARCH_FILE_BYTES;
+        return Err(VcError::new(
+            ErrorKind::Usage,
+            format!(
+                "{}: {len} bytes exceeds the {cap}-byte match limit, and a match plan \
+                 cannot certify a file it did not read",
+                rel.display()
+            ),
+        )
+        .with_next(format!(
+            "add {} to .vcignore, or narrow the scope paths",
+            rel.display()
+        )));
+    }
 
     let (sites, content_by_path, warnings) =
         match_sites(root, pattern, rewrite, &lang, &scope_files)?;
@@ -1158,6 +1209,13 @@ fn cmd_query_symbol(
 /// warning surfacing, because both work over `Vec<QueryHit>` and a file
 /// `match_sites` had to skip must not fail a query that still found real
 /// sites.
+///
+/// An oversized file in scope is pre-filtered out with a warning, in the
+/// same shape the literal/regex search reports its own size skips — a
+/// query has no certificate to keep honest, so an unread file is a
+/// reported gap in the answer rather than a reason to refuse. (`vc plan
+/// match` takes the opposite policy for exactly that reason; see
+/// [`plan_match_pipeline`].)
 fn cmd_query_ast(
     root: &Path,
     pattern: &str,
@@ -1167,7 +1225,26 @@ fn cmd_query_ast(
     epoch8: String,
 ) -> VcResult<CmdOutcome> {
     let (lang, scope_files) = infer_scope_lang(root, scope, lang)?;
-    let (hits, warnings) = velocity_code_query::search_ast(root, pattern, &lang, &scope_files)?;
+
+    let cap = velocity_code_query::MAX_SEARCH_FILE_BYTES;
+    let oversized = oversized_scope_files(root, &scope_files);
+    let mut warnings: Vec<String> = oversized
+        .iter()
+        .map(|(rel, len)| {
+            format!(
+                "{}: skipped — {len} bytes exceeds the {cap}-byte search limit",
+                rel.display()
+            )
+        })
+        .collect();
+    let scope_files: Vec<std::path::PathBuf> = scope_files
+        .into_iter()
+        .filter(|rel| !oversized.iter().any(|(o, _)| o == rel))
+        .collect();
+
+    let (hits, matcher_warnings) =
+        velocity_code_query::search_ast(root, pattern, &lang, &scope_files)?;
+    warnings.extend(matcher_warnings);
     Ok(query_hits_outcome(root, &hits, budget, epoch8, warnings))
 }
 

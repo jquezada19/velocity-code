@@ -48,7 +48,14 @@ const BINARY_SNIFF_LEN: usize = 8192;
 ///
 /// The skip is reported, never silent: an unsearched file is a gap in the
 /// answer, and the caller has to be able to see it.
-const MAX_SEARCH_FILE_BYTES: u64 = 16 * 1024 * 1024;
+///
+/// Public because the structural paths need the SAME number: the AST
+/// matcher (`velocity_code_select::match_sites`) reads every file it is
+/// handed, whole, and deliberately retains every buffer for the
+/// certificate's single-read discipline — so the gate has to live at its
+/// callers, and there must be exactly one definition of "too big to read"
+/// across every read verb rather than two that can drift.
+pub const MAX_SEARCH_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Longest `line_text` a [`QueryHit`] will carry, in bytes of the source
 /// line. A hit past this is rendered as a window CENTERED on the match

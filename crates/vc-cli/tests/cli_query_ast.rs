@@ -107,3 +107,42 @@ fn ast_mode_accepts_explicit_lang() {
         .assert()
         .success();
 }
+
+/// The other half of the size policy: `vc query --ast` SKIPS an oversized
+/// scope file with a warning rather than refusing, because a query has no
+/// certificate to keep honest — an unread file is a reported gap in the
+/// answer, not a reason to fail. (`vc plan match` refuses on the same
+/// fixture; see `cli_match.rs`.) The warning uses the same shape the
+/// literal/regex search uses for its own size skips.
+#[test]
+fn ast_mode_skips_an_oversized_scope_file_with_a_warning() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
+
+    // Sparse, so the fixture costs no real disk.
+    let cap = velocity_code_query::MAX_SEARCH_FILE_BYTES;
+    let big = std::fs::File::create(r.join("big.rs")).unwrap();
+    big.set_len(cap + 1).unwrap();
+    drop(big);
+
+    let out = vc(r)
+        .args(["query", "fetch_config($$$A)", "--ast"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("1 hits"),
+        "the small file is still searched: {stdout}"
+    );
+    assert!(stdout.contains("a.rs:1:13"), "got: {stdout}");
+
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("big.rs") && stderr.contains("exceeds"),
+        "the skip is reported, never silent: {stderr}"
+    );
+}

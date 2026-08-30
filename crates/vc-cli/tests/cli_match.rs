@@ -414,3 +414,61 @@ fn show_json_includes_warnings_key_when_plan_has_some() {
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].as_str().unwrap().contains("bad.rs"));
 }
+
+/// An oversized file in the selector's scope REFUSES the plan (`usage`,
+/// exit 2) rather than being skipped. The matcher reads every scope file
+/// whole, and the plan's certificate is hashed from exactly those reads —
+/// a file quietly dropped from the match pass would be a hole in the
+/// certificate, so the apply-time scope-drift check could never notice a
+/// site appearing in it. The refusal names the file and its size, and
+/// points at the two ways out.
+///
+/// The fixture is sparse (`set_len`), so it costs no real disk — and the
+/// gate settles it from `metadata`, so the body is never materialized.
+#[test]
+fn an_oversized_scope_file_refuses_the_match_plan_rather_than_skipping_it() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
+
+    let cap = velocity_code_query::MAX_SEARCH_FILE_BYTES;
+    let big = std::fs::File::create(r.join("big.rs")).unwrap();
+    big.set_len(cap + 1).unwrap();
+    drop(big);
+
+    let out = vc(r)
+        .args([
+            "plan",
+            "match",
+            "--pattern",
+            "fetch_config($$$A)",
+            "--rewrite",
+            "load_config($$$A)",
+        ])
+        .assert()
+        .code(2)
+        .get_output()
+        .stderr
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.starts_with("usage: "), "got: {text}");
+    assert!(
+        text.contains("big.rs"),
+        "the refusal names the file: {text}"
+    );
+    assert!(
+        text.contains(&(cap + 1).to_string()),
+        "the refusal names the size: {text}"
+    );
+    assert!(
+        text.contains(".vcignore"),
+        "the refusal points at a way out: {text}"
+    );
+
+    // Nothing was stored: the refusal happens before the match pass.
+    assert!(
+        !r.join(".vc/plans").exists()
+            || std::fs::read_dir(r.join(".vc/plans")).unwrap().count() == 0,
+        "an oversized-scope refusal must store no plan"
+    );
+}
