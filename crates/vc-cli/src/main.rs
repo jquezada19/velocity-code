@@ -634,13 +634,16 @@ fn check_scope_drift(root: &Path, sha8: &str) -> VcResult<()> {
             // drift is exclusively about files OUTSIDE the plan.
             continue;
         }
-        // Read directly (rather than through `hash::file_hash`) so a read
-        // failure's `io::ErrorKind` survives to distinguish the two cases
-        // below — `hash::file_hash`'s `?` collapses every I/O error into
-        // `ErrorKind::Io` with just the `Display` string, which loses
-        // exactly the distinction this needs.
-        let bytes = match std::fs::read(root.join(&rel)) {
-            Ok(b) => b,
+        // `file_hash_io` rather than `file_hash` so a read failure's
+        // `io::ErrorKind` survives to distinguish the two cases below —
+        // `file_hash`'s `?` collapses every I/O error into `ErrorKind::Io`
+        // with just the `Display` string, which loses exactly the
+        // distinction this needs. It STREAMS: this used to be a whole-file
+        // `fs::read` + `bytes_hash`, which made one oversized candidate
+        // cost its full length in resident memory just to decide it had
+        // not drifted.
+        let current_hash = match hash::file_hash_io(&root.join(&rel)) {
+            Ok(h) => h,
             // Deleted since plan time: benign — a file that no longer
             // exists cannot contain a new match, so it's simply out of
             // scope now, same as if it had never been in scope.
@@ -665,7 +668,6 @@ fn check_scope_drift(root: &Path, sha8: &str) -> VcResult<()> {
                 .with_next(format!("vc plan refresh {sha8}")));
             }
         };
-        let current_hash = hash::bytes_hash(&bytes);
         let drifted = match cert.scope_files.get(&rel) {
             Some(old_hash) => *old_hash != current_hash,
             None => true, // new file — absent from the certificate entirely
