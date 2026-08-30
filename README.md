@@ -151,6 +151,11 @@ named set); it never authorizes a write the kernel would otherwise refuse.
   elided` in `outline`'s header; `--json` carries `"elided": N` in all
   four, and its `hits` array is sliced to match, so `hits.length + elided`
   is always the true total.
+- A hit's `text` on a very long line is a **window, not the line**: it is
+  clamped to 500 bytes centered on the match and marked with a trailing
+  `…`. `col` is unaffected — it is the 1-based byte column in the
+  **original** line, not an index into `text` — so do not slice `text` by
+  `col`.
 - **Budget semantics**: `--budget N` is checked against the *content* —
   the rendered hits or the read's line-prefixed text — using a `(bytes +
   3) / 4` token estimate. The `bytes_out` figure `vc gain` accounts
