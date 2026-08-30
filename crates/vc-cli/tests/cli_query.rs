@@ -418,3 +418,77 @@ fn query_symbol_mode_surfaces_a_warning_for_a_malformed_file_without_failing() {
         "got: {stderr}"
     );
 }
+
+/// `--lang` names the grammar the structural matcher parses with, so it
+/// is meaningless off `--ast`. It used to be accepted and ignored
+/// entirely — even `--lang bogus` — so a caller who believed they had
+/// constrained the search got an unconstrained one with nothing saying
+/// so. Refuse (`usage`, exit 2) instead.
+#[test]
+fn lang_without_ast_is_refused_as_ast_only() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn alpha() {}\n").unwrap();
+
+    for extra in [vec![], vec!["--regex"], vec!["--symbol"]] {
+        let mut args = vec!["query", "alpha"];
+        args.extend(extra.iter().copied());
+        args.extend(["--lang", "rust"]);
+
+        let out = vc(r)
+            .args(&args)
+            .assert()
+            .code(2)
+            .get_output()
+            .stderr
+            .clone();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with("usage: ") && text.contains("--lang applies only to --ast"),
+            "args {args:?}: {text}"
+        );
+    }
+
+    // A bogus --lang is refused the same way rather than silently ignored.
+    vc(r)
+        .args(["query", "alpha", "--lang", "not-a-language"])
+        .assert()
+        .code(2);
+
+    // The control: --ast + --lang still works.
+    vc(r)
+        .args(["query", "alpha($$$A)", "--ast", "--lang", "rust"])
+        .assert()
+        .success();
+}
+
+/// An empty `--symbol` name falls through the exact tier into the fuzzy
+/// tier, where `contains("")` is true of every symbol in the tree — the
+/// same materialize-everything shape an empty content pattern already
+/// refuses, arriving through the symbol door. Both verbs refuse it.
+#[test]
+fn an_empty_symbol_name_is_refused_by_query_and_read() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
+
+    for name in ["", "   "] {
+        let out = vc(r)
+            .args(["query", "--symbol", "--", name])
+            .assert()
+            .code(2)
+            .get_output()
+            .stderr
+            .clone();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("usage: "), "name {name:?}: {text}");
+
+        vc(r).args(["read", "--symbol", name]).assert().code(2);
+    }
+
+    // The control: a real name still resolves.
+    vc(r)
+        .args(["query", "alpha", "--symbol"])
+        .assert()
+        .success();
+}

@@ -387,6 +387,20 @@ pub fn search_symbol(
     name: &str,
     scope: &[PathBuf],
 ) -> VcResult<(Vec<SymbolHit>, bool, Vec<String>)> {
+    // An EMPTY (or whitespace-only) name is refused, for the same reason
+    // an empty content pattern is: the exact tier finds nothing, so the
+    // search falls through to the fuzzy tier, where `contains("")` is true
+    // of every symbol in the tree — every symbol materialized as a hit,
+    // before any `--budget` could trim it. That is the same amplification
+    // shape `search_literal` already refuses, arriving through the symbol
+    // door.
+    if name.trim().is_empty() {
+        return Err(VcError::new(
+            ErrorKind::Usage,
+            "empty symbol name — it would match every symbol in the tree",
+        )
+        .with_next("vc query <name> --symbol"));
+    }
     let (ix, _epoch) = index::refresh(root)?;
     let name_lower = name.to_lowercase();
     let mut exact = Vec::new();

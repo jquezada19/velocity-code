@@ -981,6 +981,19 @@ fn cmd_query(root: &Path, cwd: &Path, args: QueryArgs<'_>) -> VcResult<CmdOutcom
             "query: --symbol, --regex, and --ast are mutually exclusive",
         ));
     }
+    // `--lang` names the grammar the structural matcher parses with; the
+    // literal, `--regex` and `--symbol` modes have no such knob. Passing
+    // it off `--ast` used to be accepted and ignored ENTIRELY — `vc query
+    // X --lang bogus` behaved exactly like `vc query X`, so a caller who
+    // believed they had constrained the search got an unconstrained one
+    // with nothing in the output to say so. An ignored flag is a silent
+    // lie about what ran; refuse instead.
+    if lang.is_some() && !ast {
+        return Err(
+            VcError::new(ErrorKind::Usage, "query: --lang applies only to --ast")
+                .with_next(format!("vc query {pattern} --ast --lang <L>")),
+        );
+    }
 
     let scope = paths
         .iter()
@@ -1475,6 +1488,17 @@ fn cmd_read_path(
 /// at `vc query --symbol`, which is the verb that may legitimately answer
 /// fuzzily.
 fn cmd_read_symbol(root: &Path, name: &str, budget: Option<usize>) -> VcResult<CmdOutcome> {
+    // `search_symbol` refuses an empty name itself (it would match every
+    // symbol in the tree through the fuzzy tier), and this path is already
+    // covered by that. Stating it here too costs nothing and lets the
+    // refusal name the verb the caller actually typed.
+    if name.trim().is_empty() {
+        return Err(
+            VcError::new(ErrorKind::Usage, "read: --symbol needs a name")
+                .with_next("vc read --symbol <name>"),
+        );
+    }
+
     let (_ix, epoch) = index::refresh(root)?;
     let epoch8 = index::epoch8(&epoch).to_string();
 
@@ -1523,8 +1547,13 @@ fn cmd_read_symbol(root: &Path, name: &str, budget: Option<usize>) -> VcResult<C
     let content = std::fs::read_to_string(root.join(&hit.path))
         .map_err(|e| VcError::new(ErrorKind::Io, format!("{path_disp}: {e}")))?;
     let lines: Vec<&str> = content.lines().collect();
-    let start = hit.symbol.start_line;
-    let end = hit.symbol.end_line.min(lines.len());
+    let (start, end) = resolve_symbol_span(
+        &path_disp,
+        name,
+        lines.len(),
+        hit.symbol.start_line,
+        hit.symbol.end_line,
+    )?;
 
     // Same non-fatal-warning posture as `cmd_query_symbol`: a malformed
     // file elsewhere in the search must not fail a read that found its
@@ -1539,6 +1568,41 @@ fn cmd_read_symbol(root: &Path, name: &str, budget: Option<usize>) -> VcResult<C
         budget,
         warning: join_warnings(warnings),
     })
+}
+
+/// Fit a symbol's span onto the file as it reads NOW, refusing rather
+/// than rendering an impossible range.
+///
+/// `cmd_read_symbol` reads the file TWICE: once inside `search_symbol`, to
+/// parse out the symbol table, and again here to render the body. The file
+/// can shrink in between. `end` was already clamped to the file's true
+/// length, but `start` was not — so a file truncated in that window
+/// produced an inverted `start > end` range, which renders as an empty
+/// body under a header claiming a span that no longer exists, at exit 0. A
+/// caller was told nothing was wrong and handed nothing.
+///
+/// `start` past the file's end is therefore `NotFound`, naming the true
+/// length and the fact that the file moved; `end` past it still clamps,
+/// which is the ordinary "the symbol's last line is the file's last line"
+/// case and not an error.
+fn resolve_symbol_span(
+    path_disp: &str,
+    name: &str,
+    total: usize,
+    start: usize,
+    end: usize,
+) -> VcResult<(usize, usize)> {
+    if start > total {
+        return Err(VcError::new(
+            ErrorKind::NotFound,
+            format!(
+                "{path_disp}: symbol span {start}-{end} beyond EOF ({total} lines) — \
+                 file changed since lookup"
+            ),
+        )
+        .with_next(format!("vc query {name} --symbol")));
+    }
+    Ok((start, end.min(total)))
 }
 
 /// What a `read` resolved to, ready to render. The two modes differ only
@@ -1701,4 +1765,61 @@ fn main() {
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shrink race, pinned at the one step that can observe it.
+    ///
+    /// End-to-end this needs a write to land between `cmd_read_symbol`'s
+    /// two reads, which are back-to-back with no hook in between — there
+    /// is no cache to poison and no point at which a test can interpose,
+    /// so the race is not reachable from an integration test without a
+    /// fault-injection point that does not exist. The span step is
+    /// therefore extracted and fed the stale span directly: a symbol found
+    /// at lines 40-52 in a file that is now 10 lines long is exactly what
+    /// the second read would produce after a truncation.
+    #[test]
+    fn a_symbol_span_past_eof_refuses_instead_of_rendering_an_inverted_range() {
+        let err = resolve_symbol_span("a.rs", "target", 10, 40, 52).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::NotFound);
+        assert_eq!(err.exit_code(), 1);
+        assert!(
+            err.message
+                .contains("symbol span 40-52 beyond EOF (10 lines)"),
+            "the refusal names the span and the file's true length: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("file changed since lookup"),
+            "...and says why: {}",
+            err.message
+        );
+        assert_eq!(err.next.as_deref(), Some("vc query target --symbol"));
+    }
+
+    /// The ordinary cases the refusal must not swallow: a span that fits
+    /// is returned unchanged, and an `end` past EOF still CLAMPS — that is
+    /// the everyday "the symbol's last line is the file's last line" case,
+    /// not a race. `start == total` is the boundary and is still valid: it
+    /// names the file's final line.
+    #[test]
+    fn a_symbol_span_within_the_file_is_returned_and_only_the_end_clamps() {
+        assert_eq!(
+            resolve_symbol_span("a.rs", "t", 100, 40, 52).unwrap(),
+            (40, 52)
+        );
+        assert_eq!(
+            resolve_symbol_span("a.rs", "t", 50, 40, 52).unwrap(),
+            (40, 50)
+        );
+        assert_eq!(
+            resolve_symbol_span("a.rs", "t", 40, 40, 40).unwrap(),
+            (40, 40)
+        );
+        // One line further and there is no content to render at all.
+        assert!(resolve_symbol_span("a.rs", "t", 39, 40, 40).is_err());
+    }
 }
