@@ -191,10 +191,9 @@ fn after_refresh_the_refreshed_plan_applies_cleanly() {
     );
 }
 
-/// Fix round 1 (review finding, Important): a selector-visible, out-of-plan
-/// file that becomes UNREADABLE (permissions flipped, not deleted) must
-/// fail CLOSED — refuse `ScopeDrift` naming it — rather than being
-/// silently skipped. A file outside `plan.files` is invisible to the
+/// A selector-visible, out-of-plan file that becomes UNREADABLE
+/// (permissions flipped, not deleted) must fail CLOSED — refuse
+/// `ScopeDrift` naming it — rather than being silently skipped. A file outside `plan.files` is invisible to the
 /// kernel's own stale check, so this drift check is the ONE place that can
 /// catch it; treating "can't read it" the same as "definitely unchanged"
 /// would leave exactly the gap the check exists to close.
@@ -249,11 +248,11 @@ fn deleted_candidate_is_benign_apply_still_succeeds() {
     );
 }
 
-/// Fix round 1 (folded minor): when MORE THAN ONE out-of-plan file drifted
-/// into a live match, the refusal names the first drifted path and counts
-/// ONLY that file's own sites — not the total across every drifted file
-/// (the bug: `b.rs`'s message previously reported `c.rs`'s sites too) —
-/// and separately notes how many OTHER files also drifted.
+/// When MORE THAN ONE out-of-plan file drifted into a live match, the
+/// refusal names the first drifted path and counts ONLY that file's own
+/// sites — never the total across every drifted file, which would
+/// attribute one file's sites to another — and separately notes how many
+/// OTHER files also drifted.
 #[test]
 fn multi_file_drift_attributes_site_count_per_file() {
     let d = tempfile::tempdir().unwrap();

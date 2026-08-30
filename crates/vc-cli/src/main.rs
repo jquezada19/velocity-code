@@ -542,10 +542,10 @@ fn cmd_show(root: &Path, sha8: &str) -> VcResult<CmdOutcome> {
         human.push_str(&format!("warning: {w}\n"));
     }
 
-    // Fix round 1 (controller ruling): `warnings` widens the spec-pinned
-    // `{sha8, preview}` `--json` shape, so it must appear ONLY when
-    // non-empty — mirroring `Plan`'s own `skip_serializing_if` philosophy
-    // for `selector`/`certificate`/`warnings` (see plan.rs) rather than
+    // `warnings` widens the spec-pinned `{sha8, preview}` `--json`
+    // shape, so it appears ONLY when non-empty — mirroring `Plan`'s own
+    // `skip_serializing_if` philosophy for
+    // `selector`/`certificate`/`warnings` (see plan.rs) rather than
     // always emitting `"warnings": []` for every edit/import plan.
     let mut json = serde_json::json!({
         "sha8": sha8_full,
@@ -584,7 +584,17 @@ fn cmd_show(root: &Path, sha8: &str) -> VcResult<CmdOutcome> {
 /// returns before `apply::apply_plan` is ever called — a refusal here
 /// leaves the tree completely untouched.
 ///
-/// An edit/import plan (`certificate: None`) skips this entirely: there
+/// **Best-effort in time, not a lock.** This runs BEFORE the journal lock
+/// is taken, so a write landing in the window between this check and the
+/// apply is not caught here. The kernel's own hash gate — which
+/// re-verifies every named file's content under the lock, immediately
+/// before writing — remains the authoritative check. What this adds is
+/// coverage the kernel structurally cannot have: files OUTSIDE the plan's
+/// named set, which the hash gate never looks at. So the window is not a
+/// correctness hole; it can only cost a refusal that would have been
+/// raised, never grant a write that should have been refused.
+///
+/// An edit/import plan (form `Edit`/`Import`) skips this entirely: there
 /// is no selector to have drifted.
 fn check_scope_drift(root: &Path, sha8: &str) -> VcResult<()> {
     let plan = Plan::load(root, sha8)?;
@@ -636,14 +646,14 @@ fn check_scope_drift(root: &Path, sha8: &str) -> VcResult<()> {
             // scope now, same as if it had never been in scope.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             // Any OTHER read failure (permissions flipped, transient EIO,
-            // ...) is the fail-OPEN gap review round 1 caught: a file
-            // outside `plan.files` is invisible to the kernel's own stale
-            // check, so silently skipping it here — the one place this
-            // check is the sole guard — would let a file whose current
-            // content (and thus match status) is genuinely unknown slip
-            // straight through to apply. Refuse instead, same
-            // conservative posture as an unparseable candidate below: a
-            // file you can't read is a file you can't clear.
+            // ...) must fail CLOSED. A file outside `plan.files` is
+            // invisible to the kernel's own stale check, so this is the
+            // one place it can be caught at all; skipping it silently
+            // would let a file whose current content — and therefore
+            // whose match status — is genuinely unknown pass straight
+            // through to apply. Refuse instead, the same conservative
+            // posture as an unparseable candidate below: a file you
+            // cannot read is a file you cannot clear.
             Err(e) => {
                 return Err(VcError::new(
                     ErrorKind::ScopeDrift,
@@ -672,13 +682,14 @@ fn check_scope_drift(root: &Path, sha8: &str) -> VcResult<()> {
     let (sites, _content_by_path, warnings) =
         match_sites(root, &sel.pattern, &sel.rewrite, &sel.lang, &candidates)?;
 
-    // A live match in a drifted, out-of-plan file: the canonical "24th
-    // site" refusal. Attribution stays per-file (fix round 1): `n` names
-    // ONLY the first drifted path's own site count, not the total across
-    // every drifted file, which previously misattributed sites in a
-    // SECOND drifted file to the one named in the message. When more than
-    // one file drifted, that fact is still surfaced — via a trailing
-    // `(+k more file(s))` — without folding their counts into `n`.
+    // A live match in a drifted, out-of-plan file: the canonical
+    // "a site appeared where you weren't looking" refusal. Attribution
+    // is strictly per-file: `n` names ONLY the first drifted path's own
+    // site count, never the total across every drifted file, which would
+    // report a second file's sites against the one the message names.
+    // When more than one file drifted, that fact is still surfaced — via
+    // a trailing `(+k more file(s))` — without folding their counts
+    // into `n`.
     if let Some(first) = sites.first() {
         let mut sites_by_file: std::collections::BTreeMap<&std::path::Path, usize> =
             std::collections::BTreeMap::new();

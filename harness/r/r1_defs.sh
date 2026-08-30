@@ -11,7 +11,13 @@
 # with a non-empty hits[] still means zero exact matches; see the vc-query
 # fuzzy-fallback contract this harness pins).
 #
-# Gate thresholds (spec-pinned): top-1 >= 98% AND confidently-wrong <= 1%.
+# Gate thresholds (spec-pinned), computed over the POSITIVE rows only:
+# top-1 >= 98% AND confidently-wrong <= 1% of the labeled definitions. The
+# NONE rows are negative controls and are scored separately, all-or-nothing
+# — folding them into the top-1 ratio inflated the denominator with rows
+# that are not top-1 questions at all, so a real top-1 regression could be
+# masked by negative controls passing.
+#
 # "Confidently wrong" = a `fuzzy: false` top-1 whose path:line differs from
 # the label — i.e. vc was SURE and still picked the wrong definition, the
 # failure mode that actually misleads a caller (a fuzzy=true miss just means
@@ -20,17 +26,29 @@ set -uo pipefail
 corpus="$(cd "$(dirname "$0")/corpus_defs" && pwd)"
 truth="$(dirname "$0")/r1_defs/ground_truth.tsv"
 
+# `vc` finds its repo root by walking UP from the CWD looking for `.vc/`,
+# so without a `.vc` of its own the corpus silently binds to whichever
+# ancestor has one — this repo's, making every query run against the wrong
+# tree. Demonstrated leak, not a hypothetical: run from a checkout, the
+# corpus queries resolved against velocity-code itself.
+mkdir -p "$corpus/.vc"
+
 top1_correct=0
 confidently_wrong=0
-n=0
+neg_correct=0
+n_pos=0
+n_neg=0
 out_tmp="$(mktemp)"
 trap 'rm -f "$out_tmp"' EXIT
 
 while IFS=$'\t' read -r name kind loc || [ -n "$name" ]; do
   [ -z "$name" ] && continue
-  n=$((n + 1))
 
-  vc_out=$(cd "$corpus" && vc query "$name" --symbol --json </dev/null)
+  # `--` before the data argument: a ground-truth name is arbitrary text,
+  # and one that happens to begin with `-` would otherwise be parsed as a
+  # flag. `--json` goes BEFORE the subcommand (it is a global flag), since
+  # after `--` it would be read as a positional scope path.
+  vc_out=$(cd "$corpus" && vc --json query --symbol -- "$name" </dev/null)
   vc_rc=$?
   if [ "$vc_rc" -ne 0 ]; then
     echo "vc error (exit $vc_rc) on name [$name]: $vc_out" >&2
@@ -55,14 +73,16 @@ while IFS=$'\t' read -r name kind loc || [ -n "$name" ]; do
     # returns the fuzzy pool when the exact pool is empty, so fuzzy=true is
     # exactly "zero exact matches" — hits[] may still be non-empty (fuzzy
     # substring fallback), which is not a failure for a NONE row.
+    n_neg=$((n_neg + 1))
     if [ "$fuzzy" != "true" ]; then
       echo "MISS $name expected NONE got $got_path:$got_line fuzzy=$fuzzy"
       continue
     fi
-    top1_correct=$((top1_correct + 1))
+    neg_correct=$((neg_correct + 1))
     continue
   fi
 
+  n_pos=$((n_pos + 1))
   got="$got_path:$got_line"
   if [ "$got" = "$loc" ]; then
     top1_correct=$((top1_correct + 1))
@@ -74,21 +94,30 @@ while IFS=$'\t' read -r name kind loc || [ -n "$name" ]; do
   fi
 done <"$truth"
 
-# Integer-percent thresholds via *100 comparison (no bc/awk float dependency,
-# same style as this repo's other gates): top1 >= 98% <=> top1*100 >= n*98;
-# wrong <= 1% <=> wrong*100 <= n*1.
-top1_pct=$(awk -v c="$top1_correct" -v t="$n" 'BEGIN { printf "%.2f", (t > 0 ? c / t * 100 : 0) }')
-wrong_pct=$(awk -v c="$confidently_wrong" -v t="$n" 'BEGIN { printf "%.2f", (t > 0 ? c / t * 100 : 0) }')
+# Percentages for the report line only; the gate comparisons below are
+# integer (*100 vs *98 / *1), so nothing depends on the formatting.
+top1_pct=$(awk -v c="$top1_correct" -v t="$n_pos" 'BEGIN { printf "%.2f", (t > 0 ? c / t * 100 : 0) }')
+wrong_pct=$(awk -v c="$confidently_wrong" -v t="$n_pos" 'BEGIN { printf "%.2f", (t > 0 ? c / t * 100 : 0) }')
 
-echo "R1 definitions: top-1 $top1_correct/$n (${top1_pct}%), confidently-wrong $confidently_wrong/$n (${wrong_pct}%)"
+echo "R1 definitions: top-1 $top1_correct/$n_pos (${top1_pct}%), negative controls $neg_correct/$n_neg, confidently-wrong $confidently_wrong/$n_pos (${wrong_pct}%)"
 
 fail=0
-if [ $((top1_correct * 100)) -lt $((n * 98)) ]; then
+# Both thresholds are over the POSITIVE rows: top1 >= 98% <=> top1*100 >=
+# n_pos*98; wrong <= 1% <=> wrong*100 <= n_pos*1.
+if [ $((top1_correct * 100)) -lt $((n_pos * 98)) ]; then
   echo "R1 definitions: FAIL — top-1 ${top1_pct}% < 98% threshold"
   fail=1
 fi
-if [ $((confidently_wrong * 100)) -gt $((n * 1)) ]; then
+if [ $((confidently_wrong * 100)) -gt $((n_pos * 1)) ]; then
   echo "R1 definitions: FAIL — confidently-wrong ${wrong_pct}% > 1% threshold"
+  fail=1
+fi
+# Negative controls are all-or-nothing: each one asserts that a name with
+# no definition in the corpus produces zero EXACT matches. A single failure
+# means vc claimed certainty about a definition that does not exist, which
+# no percentage should be allowed to average away.
+if [ "$neg_correct" -ne "$n_neg" ]; then
+  echo "R1 definitions: FAIL — negative controls $neg_correct/$n_neg"
   fail=1
 fi
 if [ "$fail" -eq 0 ]; then

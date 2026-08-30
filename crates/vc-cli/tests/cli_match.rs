@@ -320,8 +320,8 @@ fn match_plan_with_skipped_file_stores_warning_and_show_prints_it() {
     assert!(text.contains("did not parse"), "preview: {text}");
 }
 
-/// Fix round 1 (controller ruling): `vc show --json` must not widen the
-/// spec-pinned `{sha8, preview}` shape for a plan that has no warnings —
+/// `vc show --json` must not widen the spec-pinned `{sha8, preview}`
+/// shape for a plan that has no warnings —
 /// `"warnings"` must be ABSENT, not present as an empty array. Pins the
 /// exact key set, not just individual key presence.
 #[test]

@@ -84,12 +84,13 @@ pub struct ProvenanceCert {
     /// drift check re-derives candidates with the identical definition
     /// against the current tree — a changed or new selector-visible file
     /// outside the plan's named set triggers a selector re-run.
-    /// (Controller ruling, review round 1, 2026-08-29: the cert's scope
-    /// must agree exactly with Task 14's re-derivation, so both sides use
-    /// this one filter — `walk::walk_scoped(selector.paths)` restricted
-    /// to entries where `lang_tag(path) == selector.lang` — rather than
-    /// the wider "every file in scope regardless of language" this
-    /// started as.)
+    /// The two sides must agree EXACTLY or the comparison is
+    /// meaningless, so both use this one filter:
+    /// `walk::walk_scoped(selector.paths)` restricted to entries where
+    /// `lang_tag(path) == selector.lang`. A wider definition on either
+    /// side ("every file in scope regardless of language") would make
+    /// files appear to enter or leave scope purely by which side was
+    /// asking.
     pub scope_files: BTreeMap<PathBuf, String>,
 }
 
@@ -267,8 +268,8 @@ impl Plan {
             }
         }
 
-        // CRITICAL (review round 1): unlike `build`'s edits, which come
-        // from `resolve_edits_with_content` and are already sorted and
+        // Unlike `build`'s edits, which come from
+        // `resolve_edits_with_content` and are already sorted and
         // overlap-checked, `build_match`'s edits arrive verbatim from an
         // external selector run — a nested pattern match (e.g. `foo($$$A)`
         // over `foo(foo(x))`) can genuinely produce two overlapping sites.
@@ -923,9 +924,8 @@ mod tests {
     /// `ResolvedEdit`s exactly like `build` does, but the certificate must
     /// cover the whole selector-VISIBLE scope — including `b.rs`, which
     /// is in-scope but untouched by any edit — while excluding `notes.txt`,
-    /// which is in-scope but not `selector.lang` (controller ruling,
-    /// review round 1: `scope_files` = scope walk ∩ `lang_tag ==
-    /// selector.lang`).
+    /// which is in-scope but not `selector.lang` (`scope_files` = scope
+    /// walk ∩ `lang_tag == selector.lang`).
     #[test]
     fn build_match_populates_files_realpaths_edits_and_a_lang_filtered_certificate() {
         let d = tempfile::tempdir().unwrap();
@@ -1181,9 +1181,8 @@ mod tests {
         );
     }
 
-    /// CRITICAL (review round 1): a selector run (e.g. a nested pattern
-    /// match) can hand `build_match` two genuinely overlapping sites in
-    /// the same file. `apply::apply_plan`'s splice loop trusts "edits are
+    /// A selector run (e.g. a nested pattern match) can hand
+    /// `build_match` two genuinely overlapping sites in the same file. `apply::apply_plan`'s splice loop trusts "edits are
     /// non-overlapping and sorted" and cannot itself catch a violation, so
     /// `build_match` must refuse before ever storing the plan.
     #[test]
@@ -1276,9 +1275,9 @@ mod tests {
         assert_eq!(p.edits[1].start, second.start);
     }
 
-    /// FOLDED MINOR 4 (review round 1): `content_by_path` crosses a public
-    /// API boundary — a caller that forgets a named file's bytes must get
-    /// a `Usage` refusal naming the path, not a panic.
+    /// `content_by_path` crosses a public API boundary — a caller that
+    /// forgets a named file's bytes must get a `Usage` refusal naming the
+    /// path, not a panic.
     #[test]
     fn build_match_refuses_an_edit_with_no_matching_content_entry() {
         let d = tempfile::tempdir().unwrap();
@@ -1308,10 +1307,10 @@ mod tests {
         assert!(err.message.contains("a.rs"));
     }
 
-    /// FOLDED MINOR 2 (review round 1): a match-form plan must round-trip
-    /// through `Plan::store`/`Plan::load` exactly like an edit-form plan
-    /// does — the content-addressed integrity check must pass end-to-end
-    /// on the new form, not just on the old one.
+    /// A match-form plan must round-trip through
+    /// `Plan::store`/`Plan::load` exactly like an edit-form plan does —
+    /// the content-addressed integrity check must pass end-to-end on the
+    /// new form, not just on the old one.
     #[test]
     fn build_match_plan_store_load_roundtrips_and_passes_integrity() {
         let d = tempfile::tempdir().unwrap();
@@ -1389,10 +1388,9 @@ mod tests {
         assert!(!json.contains("warnings"));
     }
 
-    /// FOLDED MINOR 1 (review round 1): the digest must cover the new
-    /// fields the same way it covers every other field — mutating
-    /// `selector.pattern` or a single `certificate.scope_files` entry must
-    /// change `id()`.
+    /// The digest must cover `selector`/`certificate` the same way it
+    /// covers every other field — mutating `selector.pattern` or a single
+    /// `certificate.scope_files` entry must change `id()`.
     #[test]
     fn digest_covers_selector_and_certificate_fields() {
         let selector = sample_selector(vec![]);

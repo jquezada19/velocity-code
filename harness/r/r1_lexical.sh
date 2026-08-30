@@ -49,6 +49,14 @@ set -uo pipefail
 corpus="$(cd "$(dirname "$0")/corpus" && pwd)"
 queries="$(dirname "$0")/queries_lexical.txt"
 
+# `vc` finds its repo root by walking UP from the CWD looking for `.vc/`,
+# so without a `.vc` of its own the corpus silently binds to whichever
+# ancestor has one — this repo's, making vc and rg search different trees
+# and every "parity" result meaningless. Demonstrated leak, not a
+# hypothetical: run from a checkout, the corpus queries resolved against
+# velocity-code itself.
+mkdir -p "$corpus/.vc"
+
 # One --ignore-file per .vcignore found anywhere under the corpus (root and
 # every subdirectory) — see the flag-rationale block above.
 rg_ignore_args=()
@@ -65,16 +73,23 @@ trap 'rm -f "$vc_tmp" "$rg_tmp"' EXIT
 while IFS=$'\t' read -r mode q || [ -n "$mode" ]; do
   [ -z "$mode" ] && continue
   n=$((n + 1))
+  # `--` before the data argument on both sides (the rg side always had
+  # it): a query is arbitrary text, and one beginning with `-` would
+  # otherwise be parsed as a flag — silently on the vc side, where it would
+  # look like a mismatch rather than a misparse. Every vc flag therefore
+  # goes BEFORE the `--`, and `--json` goes before the subcommand, since it
+  # is a global flag and after `--` would be read as a positional scope
+  # path.
   case "$mode" in
-  L) vcargs=(query "$q") rgargs=(-F -- "$q") ;;
-  R) vcargs=(query "$q" --regex) rgargs=(-- "$q") ;;
+  L) vcargs=(query -- "$q") rgargs=(-F -- "$q") ;;
+  R) vcargs=(query --regex -- "$q") rgargs=(-- "$q") ;;
   *)
     echo "queries_lexical.txt: bad mode '$mode' on line $n" >&2
     exit 2
     ;;
   esac
 
-  vc_out=$(cd "$corpus" && vc "${vcargs[@]}" --json </dev/null)
+  vc_out=$(cd "$corpus" && vc --json "${vcargs[@]}" </dev/null)
   vc_rc=$?
   if [ "$vc_rc" -ne 0 ]; then
     echo "vc error (exit $vc_rc) on query [$mode] $q: $vc_out" >&2

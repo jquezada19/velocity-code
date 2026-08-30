@@ -193,7 +193,8 @@ fn read_range_beyond_eof_clamps_to_true_end() {
 
 /// A range whose START is beyond EOF is unsatisfiable, not clampable —
 /// `NotFound` (exit 1), not a silent empty "success" with an inverted
-/// start>end range (fix round 1, controller ruling).
+/// start>end range, which would hide from the caller that they read
+/// nothing at all.
 #[test]
 fn read_range_start_beyond_eof_is_not_found_not_silent_empty_success() {
     let d = tempfile::tempdir().unwrap();
