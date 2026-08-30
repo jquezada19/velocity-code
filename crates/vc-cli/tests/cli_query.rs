@@ -372,7 +372,8 @@ fn query_content_modes_warn_about_a_skipped_file() {
     // Sparse, so it costs no real disk; the size gate reads `metadata`,
     // never the body.
     let big = std::fs::File::create(r.join("big.rs")).unwrap();
-    big.set_len(16 * 1024 * 1024 + 1).unwrap();
+    big.set_len(velocity_code_query::MAX_SEARCH_FILE_BYTES + 1)
+        .unwrap();
     drop(big);
 
     for mode in [vec!["query", "alpha"], vec!["query", "alpha", "--regex"]] {

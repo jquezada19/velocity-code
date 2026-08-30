@@ -469,7 +469,7 @@ fn read_capped(abs: &Path, rel: &Path, warnings: &mut Vec<String>) -> VcResult<O
     let len = file.metadata().map_err(io_err)?.len();
     if len > MAX_SEARCH_FILE_BYTES {
         warnings.push(format!(
-            "{}: skipped — {len} bytes exceeds the {MAX_SEARCH_FILE_BYTES}-byte match limit",
+            "{}: skipped — {len} bytes exceeds the {MAX_SEARCH_FILE_BYTES}-byte size limit",
             rel.display()
         ));
         return Ok(None);
@@ -486,7 +486,7 @@ fn read_capped(abs: &Path, rel: &Path, warnings: &mut Vec<String>) -> VcResult<O
         // stat-then-reopen pre-filter cannot close. Same policy as a file
         // that was already too big.
         warnings.push(format!(
-            "{}: skipped — grew past the {MAX_SEARCH_FILE_BYTES}-byte match limit while being read",
+            "{}: skipped — grew past the {MAX_SEARCH_FILE_BYTES}-byte size limit while being read",
             rel.display()
         ));
         return Ok(None);

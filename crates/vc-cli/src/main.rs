@@ -492,12 +492,14 @@ fn infer_scope_lang(
 /// Every file in `files` that is larger than
 /// [`velocity_code_query::MAX_SEARCH_FILE_BYTES`], as `(path, len)`.
 ///
-/// `velocity_code_select::match_sites` reads each scope file whole and
-/// RETAINS every buffer — that retention is correct and deliberate (the
-/// query-provenance certificate must be hashed from the bytes the match
-/// pass itself read, not a second read), which is exactly why the size
-/// gate cannot live inside the matcher. It lives at each caller, which
-/// can decide the right policy for its own verb.
+/// `velocity_code_select::match_sites` is the authoritative bound: it reads
+/// each scope file through a capped `take`, so a file already over
+/// [`velocity_code_query::MAX_SEARCH_FILE_BYTES`], or one that grows past it
+/// mid-read, is skipped there with no buffer retained — that is what closes
+/// the race between a `metadata` check here and the matcher's own read.
+/// This prefilter exists only so an oversized file gets a clearer, earlier
+/// refusal or warning message than the matcher's generic skip line, in the
+/// common case where nothing changes out from under it.
 ///
 /// A file that cannot be stat'd is NOT reported here: this function only
 /// answers "is it too big", and a missing or unreadable file is the
@@ -539,7 +541,7 @@ fn plan_match_pipeline(
         return Err(VcError::new(
             ErrorKind::Usage,
             format!(
-                "{}: {len} bytes exceeds the {cap}-byte match limit, and a match plan \
+                "{}: {len} bytes exceeds the {cap}-byte size limit, and a match plan \
                  cannot certify a file it did not read",
                 rel.display()
             ),
@@ -657,11 +659,16 @@ fn cmd_show(root: &Path, sha8: &str) -> VcResult<CmdOutcome> {
 /// is taken, so a write landing in the window between this check and the
 /// apply is not caught here. The kernel's own hash gate — which
 /// re-verifies every named file's content under the lock, immediately
-/// before writing — remains the authoritative check. What this adds is
-/// coverage the kernel structurally cannot have: files OUTSIDE the plan's
-/// named set, which the hash gate never looks at. So the window is not a
-/// correctness hole; it can only cost a refusal that would have been
-/// raised, never grant a write that should have been refused.
+/// before writing — remains the authoritative check over every NAMED file;
+/// this function never authorizes anything that gate wouldn't already
+/// allow. What this adds is coverage the gate structurally cannot have:
+/// files OUTSIDE the plan's named set, which the hash gate never looks at.
+/// The window means that added coverage is itself best-effort — an
+/// out-of-plan file that changes inside the window can be MISSED by this
+/// check for that one apply, so the drift refusal simply doesn't fire. It
+/// is a refusal that goes missing, never a bad write to a named file: the
+/// hash gate under the lock still catches any named file the window
+/// disturbs.
 ///
 /// An edit/import plan (form `Edit`/`Import`) skips this entirely: there
 /// is no selector to have drifted.
@@ -1289,7 +1296,7 @@ fn cmd_query_ast(
         .iter()
         .map(|(rel, len)| {
             format!(
-                "{}: skipped — {len} bytes exceeds the {cap}-byte search limit",
+                "{}: skipped — {len} bytes exceeds the {cap}-byte size limit",
                 rel.display()
             )
         })

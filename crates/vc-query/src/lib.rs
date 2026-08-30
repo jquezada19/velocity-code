@@ -144,7 +144,7 @@ fn read_for_search(full: &Path, rel: &Path, warnings: &mut Vec<String>) -> Optio
     let len = md.len();
     if len > MAX_SEARCH_FILE_BYTES {
         warnings.push(format!(
-            "{}: skipped — {len} bytes exceeds the {MAX_SEARCH_FILE_BYTES}-byte search limit",
+            "{}: skipped — {len} bytes exceeds the {MAX_SEARCH_FILE_BYTES}-byte size limit",
             rel.display()
         ));
         return None;
@@ -176,7 +176,7 @@ fn read_for_search(full: &Path, rel: &Path, warnings: &mut Vec<String>) -> Optio
         // stat above and this read. Same policy as a file that was
         // already too big — skip it, and say so.
         warnings.push(format!(
-            "{}: skipped — grew past the {MAX_SEARCH_FILE_BYTES}-byte search limit while being read",
+            "{}: skipped — grew past the {MAX_SEARCH_FILE_BYTES}-byte size limit while being read",
             rel.display()
         ));
         return None;
@@ -217,7 +217,7 @@ fn read_capped_source(full: &Path, rel: &Path, warnings: &mut Vec<String>) -> Op
     };
     if len > MAX_SEARCH_FILE_BYTES {
         warnings.push(format!(
-            "{}: skipped — {len} bytes exceeds the {MAX_SEARCH_FILE_BYTES}-byte search limit",
+            "{}: skipped — {len} bytes exceeds the {MAX_SEARCH_FILE_BYTES}-byte size limit",
             rel.display()
         ));
         return None;
@@ -233,7 +233,7 @@ fn read_capped_source(full: &Path, rel: &Path, warnings: &mut Vec<String>) -> Op
     }
     if bytes.len() as u64 > MAX_SEARCH_FILE_BYTES {
         warnings.push(format!(
-            "{}: skipped — grew past the {MAX_SEARCH_FILE_BYTES}-byte search limit while being read",
+            "{}: skipped — grew past the {MAX_SEARCH_FILE_BYTES}-byte size limit while being read",
             rel.display()
         ));
         return None;

@@ -483,11 +483,11 @@ fn an_over_cap_drifted_candidate_refuses_scope_drift_exit_4() {
     // all this same file still refuses — via the utf-8 warning — and the
     // test would pass while pinning nothing about the cap. Naming the
     // reason is what makes it discriminating. Either size gate satisfies
-    // it: the stat gate ("exceeds the N-byte match limit") in the ordinary
-    // case, and the probe-byte gate ("grew past the N-byte match limit")
+    // it: the stat gate ("exceeds the N-byte size limit") in the ordinary
+    // case, and the probe-byte gate ("grew past the N-byte size limit")
     // when the file wins the race.
     assert!(
-        text.contains("match limit"),
+        text.contains("size limit"),
         "the refusal is for the size, not the encoding: {text}"
     );
     assert!(

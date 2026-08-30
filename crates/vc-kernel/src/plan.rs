@@ -365,7 +365,7 @@ impl Plan {
                     ErrorKind::Usage,
                     format!(
                         "{}: in the selector's scope but not read by the match pass \
-                         (it appeared mid-planning, or exceeds the read limit) — the \
+                         (it appeared mid-planning, or exceeds the size limit) — the \
                          certificate can only be built from the bytes the selector \
                          actually read",
                         rel.display()

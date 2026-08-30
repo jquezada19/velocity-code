@@ -15,13 +15,13 @@ pub mod resolve;
 pub mod root;
 pub mod walk;
 
-/// Largest file any read verb will pull into memory whole. A file above
-/// this is skipped with a warning (`vc query`, `vc query --ast`, `vc query
-/// --symbol`) or refuses the command outright (`vc plan match`, which
-/// cannot certify a file it did not read) — never truncated into an
-/// answer.
+/// Largest file any SEARCH or MATCH read path will pull into memory whole.
+/// A file above this is skipped with a warning (`vc query`, `vc query
+/// --ast`, `vc query --symbol`) or refuses the command outright (`vc plan
+/// match`, which cannot certify a file it did not read) — never truncated
+/// into an answer.
 ///
-/// Every whole-file read path is bounded by this ONE number, and the
+/// Every SEARCH/MATCH read path is bounded by this ONE number, and the
 /// number lives here — below every crate that needs it — because both
 /// bounded readers need it and `vc-query` already depends on `vc-select`,
 /// so `vc-select` cannot borrow it from `vc-query` without a dependency
@@ -29,6 +29,14 @@ pub mod walk;
 /// rules out: the AST matcher's bound and the content search's bound are
 /// the same policy, and a caller reasoning about one is reasoning about
 /// both.
+///
+/// Deliberately NOT bounded by this cap: `vc outline`/`vc read` (an
+/// explicit single-file request names one file on purpose, unlike a scope
+/// scan) and edit-resolution reads on the write path (an edit has to read
+/// a file's full content to resolve and apply a patch against it — a file
+/// too big to read is too big to patch, so refusing the read would just
+/// move the refusal, not avoid it). Both are tracked for a future bound of
+/// their own rather than folded into this one.
 ///
 /// 16 MiB is far above any plausible hand-written source file and far
 /// below the point where reading one costs real memory. The relevant cost
