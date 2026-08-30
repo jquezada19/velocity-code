@@ -1,6 +1,7 @@
-use crate::{VcResult, hash, lang_tag, walk};
+use crate::{VcResult, hash, journal::fsync_dir, lang_tag, walk};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// On-disk magic for the versioned index header. Any file that doesn't
@@ -53,8 +54,22 @@ impl StatIndex {
     /// at — 0 for a fresh/absent index). On success, `self.generation` is
     /// updated to match what was written, so the caller's copy reflects
     /// the true on-disk state.
+    ///
+    /// Every read verb (`query`/`outline`/`read`) calls `refresh`, which
+    /// calls this — so concurrent `vc` invocations in one repo can call
+    /// `save` at the same time. Writes go to a uniquely-named temp sibling
+    /// in `.vc/` first, fsynced, then `rename`d into place (same
+    /// write-temp-then-rename discipline as `journal::write_entry`): a
+    /// rename onto an existing path is atomic on the same filesystem, so
+    /// `StatIndex::load` can never observe a torn (valid-header,
+    /// truncated/interleaved-body) file the way a bare `std::fs::write`
+    /// (truncate + write in place) could. Concurrent writers may still
+    /// race on *which* rename lands last — that's fine, the index is a
+    /// pure cache; what must never happen is a reader seeing a
+    /// partially-written one.
     pub fn save(&mut self, root: &Path) -> VcResult<()> {
-        std::fs::create_dir_all(root.join(".vc"))?;
+        let dir = root.join(".vc");
+        std::fs::create_dir_all(&dir)?;
         self.generation += 1;
         let body = bincode::serde::encode_to_vec(&*self, bincode::config::standard())
             .map_err(|e| crate::VcError::new(crate::ErrorKind::Io, e.to_string()))?;
@@ -62,7 +77,22 @@ impl StatIndex {
         bytes.extend_from_slice(INDEX_MAGIC);
         bytes.extend_from_slice(&INDEX_VERSION.to_le_bytes());
         bytes.extend_from_slice(&body);
-        std::fs::write(index_path(root), bytes)?;
+
+        let tmp = dir.join(format!(
+            "index.tmp.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, index_path(root))?;
+        fsync_dir(&dir)?;
         Ok(())
     }
 }
@@ -163,6 +193,43 @@ mod tests {
         std::fs::create_dir_all(d.path().join(".vc")).unwrap();
         std::fs::write(d.path().join(".vc/index"), b"garbage-or-old-bincode").unwrap();
         assert!(StatIndex::load(d.path()).unwrap().is_none());
+    }
+
+    /// Pins the atomicity property from the save() rewrite: after a save,
+    /// no `index.tmp.*` sibling is left behind (the temp file was renamed
+    /// away, not just written alongside) and the index loads back clean —
+    /// i.e. readers can never observe a torn file, only "absent" or
+    /// "complete". A true concurrency/torn-write test isn't required; this
+    /// pins the write-then-rename mechanism directly.
+    #[test]
+    fn save_goes_through_rename_leaving_no_tmp_sibling() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        std::fs::create_dir_all(r.join(".vc")).unwrap();
+        std::fs::write(r.join("a.rs"), "one").unwrap();
+        let (_ix, _epoch) = refresh(r).unwrap();
+
+        let tmp_leftovers: Vec<_> = std::fs::read_dir(r.join(".vc"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("index.tmp."))
+            })
+            .collect();
+        assert!(
+            tmp_leftovers.is_empty(),
+            "save() must leave no temp sibling behind, found: {tmp_leftovers:?}"
+        );
+        assert!(r.join(".vc/index").is_file(), "final index file exists");
+
+        let loaded = StatIndex::load(r).unwrap().expect("index loads back");
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(
+            loaded.entries[&PathBuf::from("a.rs")].hash,
+            crate::hash::bytes_hash(b"one")
+        );
     }
 
     #[test]

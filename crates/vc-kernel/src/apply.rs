@@ -757,8 +757,13 @@ mod tests {
     /// and the journal entry is already marked committed by the time
     /// refresh runs, so the caller must see `Ok` with a `warning`, not a
     /// failure that would make it look like nothing happened. Forces the
-    /// failure by making `.vc/index` unwritable, which `index::refresh`'s
-    /// final `ix.save` needs to overwrite.
+    /// failure by making `.vc/` itself unwritable: `StatIndex::save` (M2
+    /// PR A final-review fix — atomic write-temp-then-rename, see
+    /// `index.rs`) now stages its temp sibling directly in `.vc/`, so
+    /// removing that directory's write bit blocks the temp file's
+    /// creation without touching `.vc/journal/` (which already exists
+    /// with its own permissions untouched, so the journal write/commit
+    /// this test depends on still lands normally).
     #[cfg(unix)]
     #[test]
     fn index_refresh_failure_after_commit_degrades_to_warning_not_err() {
@@ -768,21 +773,27 @@ mod tests {
         let p = make_plan(&r, &[("a.rs", "one", "ONE")]);
         let sha8 = p.store(&r).unwrap();
 
-        let index_path = r.join(".vc/index");
+        let dot_vc = r.join(".vc");
         assert!(
-            index_path.is_file(),
+            dot_vc.join("index").is_file(),
             "Plan::build's index::refresh already created this"
         );
-        let writable = std::fs::metadata(&index_path).unwrap().permissions();
+        // `apply_plan`'s `Lock::acquire` is what actually creates
+        // `.vc/journal/` (lazily, on first apply) — it must exist
+        // *before* `.vc` loses its write bit below, or the journal
+        // machinery itself (not the index refresh this test targets)
+        // would be what fails.
+        std::fs::create_dir_all(dot_vc.join("journal")).unwrap();
+        let writable = std::fs::metadata(&dot_vc).unwrap().permissions();
         let mut readonly = writable.clone();
-        readonly.set_mode(0o400);
-        std::fs::set_permissions(&index_path, readonly).unwrap();
+        readonly.set_mode(0o500); // r-x: still traversable (journal/ writes unaffected), not writable
+        std::fs::set_permissions(&dot_vc, readonly).unwrap();
 
         let result = apply_plan(&r, &sha8);
 
         // Restore permissions unconditionally (before any assertion can
         // panic and skip cleanup) so the tempdir can still be removed.
-        std::fs::set_permissions(&index_path, writable).unwrap();
+        std::fs::set_permissions(&dot_vc, writable).unwrap();
 
         let rep = result.expect("a post-commit refresh failure must not become Err");
         assert!(
