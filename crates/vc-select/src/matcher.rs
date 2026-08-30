@@ -31,13 +31,14 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use ast_grep_core::matcher::PatternBuilder;
 use ast_grep_core::replacer::{Replacer, TemplateFix};
 use ast_grep_core::tree_sitter::{LanguageExt, StrDoc, TSLanguage};
 use ast_grep_core::{AstGrep, Language, Pattern, PatternError};
-use velocity_code_kernel::{ErrorKind, VcError, VcResult};
+use velocity_code_kernel::{ErrorKind, MAX_SEARCH_FILE_BYTES, VcError, VcResult};
 
 /// Every file [`match_sites`] scanned — matched or not — keyed by its
 /// root-relative path, holding the exact bytes that scan read. Same shape
@@ -48,6 +49,14 @@ use velocity_code_kernel::{ErrorKind, VcError, VcResult};
 /// plan's provenance certificate) can hash these bytes instead of reading
 /// the tree a second time. See [`match_sites`] for the memory cost that
 /// buys.
+///
+/// **The one exception is a file over
+/// [`velocity_code_kernel::MAX_SEARCH_FILE_BYTES`]**, which is never read
+/// and therefore has no entry. "Scanned" means "read"; a file the matcher
+/// refused to materialize was not read, and inventing an entry for it —
+/// truncated, or from a second read — would put bytes in a certificate
+/// that no scan ever saw. A caller that cannot tolerate a gap must refuse
+/// on the gap (as `Plan::build_match` does), not paper over it.
 pub type ContentByPath = BTreeMap<PathBuf, Vec<u8>>;
 
 /// One resolved rewrite site: a byte range in one file's original buffer,
@@ -314,11 +323,26 @@ fn build_pattern(pattern: &str, rewrite: &str) -> VcResult<Pattern> {
 ///   the spans are offsets into precisely these buffers, and a scope file
 ///   that produced no site still has to be described by the bytes this
 ///   scan saw rather than by whatever is on disk once the scan is over.
+///   The one absence is an over-cap file (below) — never read, so never
+///   present.
 /// * `warnings` — one line per file skipped without failing the run (not
-///   UTF-8, or its parse tree contains an error). Callers must surface
-///   these; a silently skipped file is an incomplete refactor. A skipped
-///   file's bytes are still returned in `content_by_path` — "we could not
-///   match it" is not "we did not read it".
+///   UTF-8, its parse tree contains an error, or it is over the size cap).
+///   Callers must surface these; a silently skipped file is an incomplete
+///   refactor. A file skipped for the first two reasons still has its
+///   bytes in `content_by_path` — "we could not match it" is not "we did
+///   not read it".
+///
+/// **Bounded reads.** Each file is opened once and read through
+/// `take(`[`velocity_code_kernel::MAX_SEARCH_FILE_BYTES`]` + 1)`, the same
+/// discipline `velocity_code_query`'s content search uses. A file already
+/// over the cap, and equally one that GROWS past it while being read (the
+/// extra probe byte materializes), is skipped with a warning naming it:
+/// no buffer is retained and no site is produced for it. The size gate
+/// cannot be left to the callers alone, because a caller's `metadata`
+/// check and this read are two separate lookups with a window between
+/// them — the callers keep their pre-filters for the earlier, friendlier
+/// message, and this bound is what makes the racing case safe rather than
+/// unbounded.
 ///
 /// **Memory cost.** Retaining every scanned buffer makes the whole scope
 /// resident for the life of the call: a scope of N bytes of source costs
@@ -328,7 +352,8 @@ fn build_pattern(pattern: &str, rewrite: &str) -> VcResult<Pattern> {
 /// later, for the certificate) is a plan-time TOCTOU: a file changed
 /// between the match pass and the certificate walk would be baselined
 /// *post-change* with no edit, and the apply-time scope-drift check,
-/// which compares against that baseline, would be blind to it.
+/// which compares against that baseline, would be blind to it. The cap is
+/// the ceiling on what any ONE file can contribute to that cost.
 ///
 /// Refusals: `ErrorKind::Usage` for an unknown `lang`, a non-root-relative
 /// scope path, an unparseable pattern, or a rewrite naming an unbound
@@ -374,19 +399,19 @@ pub fn match_sites(
         }
 
         let abs = root.join(rel);
-        let bytes = std::fs::read(&abs).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => VcError::new(
-                ErrorKind::NotFound,
-                format!("{}: no such file", rel.display()),
-            ),
-            _ => VcError::new(ErrorKind::Io, format!("{}: {e}", rel.display())),
-        })?;
+        let Some(bytes) = read_capped(&abs, rel, &mut warnings)? else {
+            // Over the cap: not read, so nothing to retain and nothing to
+            // match. The warning pushed by `read_capped` is the whole
+            // record of it — and for `Plan::build_match` the resulting
+            // hole in the content map is a refusal, by design.
+            continue;
+        };
 
-        // The buffer is retained for EVERY scanned file, before any skip
-        // decision: a caller's certificate has to describe what this scan
-        // saw, and a file we could not match is still a file we read.
-        // Inserting here (rather than only on a hit) is what makes the
-        // scan the single read of the scope.
+        // The buffer is retained for EVERY file this scan READ, before any
+        // match-side skip decision: a caller's certificate has to describe
+        // what this scan saw, and a file we could not match is still a file
+        // we read. Inserting here (rather than only on a hit) is what makes
+        // the scan the single read of the scope.
         let bytes = content_by_path.entry(rel.clone()).or_insert(bytes);
 
         let Ok(src) = std::str::from_utf8(bytes) else {
@@ -409,6 +434,64 @@ pub fn match_sites(
     sites.sort_by(|a, b| a.path.cmp(&b.path).then(a.start.cmp(&b.start)));
     refuse_overlaps(&sites)?;
     Ok((sites, content_by_path, warnings))
+}
+
+/// Read one scope file, bounded at [`MAX_SEARCH_FILE_BYTES`].
+///
+/// `Ok(None)` means "over the cap — skipped", with the reason pushed onto
+/// `warnings`; the caller retains no buffer and produces no sites for it.
+/// An unreadable file is still an error (`NotFound`/`Io`), unchanged: a
+/// scope file that cannot be opened is the caller's problem to raise, not
+/// a gap to warn about.
+///
+/// Mirrors `velocity_code_query`'s `read_for_search` deliberately, minus
+/// the binary sniff (a non-UTF-8 buffer is already handled downstream, and
+/// with its own warning). **Open once, then bound.** The handle is opened
+/// first and the size read from that same handle, so the gate and the read
+/// describe one file rather than two lookups of a path that could have
+/// been replaced in between. The size is still only an *opinion about the
+/// past* — a file can grow after it is stat'd — so the read is bounded
+/// too: `take(MAX + 1)`, and if that extra probe byte materializes the file
+/// is treated as over the cap rather than processed truncated. A truncated
+/// buffer would be worse than a skip in both directions: it would be
+/// matched against as if it were the file, and hashed into a certificate
+/// as if it were the file.
+fn read_capped(abs: &Path, rel: &Path, warnings: &mut Vec<String>) -> VcResult<Option<Vec<u8>>> {
+    let io_err = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::NotFound => VcError::new(
+            ErrorKind::NotFound,
+            format!("{}: no such file", rel.display()),
+        ),
+        _ => VcError::new(ErrorKind::Io, format!("{}: {e}", rel.display())),
+    };
+
+    let mut file = std::fs::File::open(abs).map_err(io_err)?;
+    let len = file.metadata().map_err(io_err)?.len();
+    if len > MAX_SEARCH_FILE_BYTES {
+        warnings.push(format!(
+            "{}: skipped — {len} bytes exceeds the {MAX_SEARCH_FILE_BYTES}-byte match limit",
+            rel.display()
+        ));
+        return Ok(None);
+    }
+
+    let mut bytes = Vec::with_capacity(len as usize);
+    (&mut file)
+        .take(MAX_SEARCH_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io_err)?;
+    if bytes.len() as u64 > MAX_SEARCH_FILE_BYTES {
+        // The probe byte arrived: the file grew past the cap between the
+        // size above and this read — precisely the window a caller's
+        // stat-then-reopen pre-filter cannot close. Same policy as a file
+        // that was already too big.
+        warnings.push(format!(
+            "{}: skipped — grew past the {MAX_SEARCH_FILE_BYTES}-byte match limit while being read",
+            rel.display()
+        ));
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 /// Match one already-read buffer. `Ok(None)` means "this file's parse tree
@@ -1039,6 +1122,66 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sites.len(), 1);
+    }
+
+    /// The matcher's OWN size bound — the amendment to "every scanned
+    /// buffer is retained", and the case a caller's pre-filter
+    /// structurally cannot cover.
+    ///
+    /// Both CLI callers stat the scope before calling here, but a stat and
+    /// this read are two separate lookups with a window between them: a
+    /// file can grow past the cap inside it, and before this bound existed
+    /// the matcher would then read it whole regardless. Feeding the
+    /// over-cap file straight to `match_sites` — the shape a lost race
+    /// produces — pins the bound itself rather than the pre-filter.
+    ///
+    /// Three assertions, and the middle one is the invariant amendment: an
+    /// over-cap file yields no site, NO CONTENT-MAP ENTRY (it was never
+    /// read, so there are no bytes of it this scan saw, and a truncated or
+    /// re-read buffer would put bytes in a certificate that no scan
+    /// produced), and a warning naming the file and its size. The missing
+    /// entry is exactly what `Plan::build_match` refuses on — see
+    /// vc-kernel's `build_match_refuses_a_scope_file_missing_from_the_
+    /// content_map`, which pins the other end of that contract.
+    #[test]
+    fn an_over_cap_file_is_skipped_with_a_warning_and_retains_no_buffer() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "a.rs", "fn main() { fetch_config(a) }\n");
+        // Sparse (`set_len`), so the fixture costs no real disk — and the
+        // gate settles it from the handle's size, so the body is never
+        // materialized either.
+        let big = std::fs::File::create(d.path().join("big.rs")).unwrap();
+        big.set_len(MAX_SEARCH_FILE_BYTES + 1).unwrap();
+        drop(big);
+
+        let (sites, content, warnings) = match_sites(
+            d.path(),
+            "fetch_config($$$A)",
+            "load_config($$$A)",
+            "rust",
+            &scope(&["a.rs", "big.rs"]),
+        )
+        .unwrap();
+
+        // The in-cap file is matched exactly as usual: one oversized file
+        // in scope must not cost the caller the rest of the answer.
+        assert_eq!(sites.len(), 1, "sites: {sites:?}");
+        assert_eq!(sites[0].path, PathBuf::from("a.rs"));
+
+        // The over-cap file produced no site and no buffer.
+        assert_eq!(
+            content.keys().collect::<Vec<_>>(),
+            vec![&PathBuf::from("a.rs")],
+            "an over-cap file was never read, so it has no content-map entry"
+        );
+
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert!(warnings[0].contains("big.rs"), "warning: {}", warnings[0]);
+        assert!(
+            warnings[0].contains(&(MAX_SEARCH_FILE_BYTES + 1).to_string()),
+            "the warning names the size: {}",
+            warnings[0]
+        );
     }
 
     /// The single-read property, stated as a map invariant: the content map

@@ -429,3 +429,72 @@ fn a_drifted_candidate_the_matcher_cannot_evaluate_refuses_scope_drift_exit_4() 
         "the hint is the caller's real next step: {text}"
     );
 }
+
+/// The size bound reaching the drift check: "cannot evaluate = cannot
+/// clear" must hold for an OVER-CAP drifted candidate exactly as it does
+/// for an unparseable one.
+///
+/// `big.rs` appears after the plan is built, so it is outside the named
+/// set and absent from the certificate — a drifted candidate. The matcher
+/// declines to read it (over the 16 MiB cap) and says so in a warning
+/// instead of returning sites. That warning is the whole verdict here:
+/// the file's match status is genuinely UNKNOWN, the kernel's stale check
+/// never looks outside the named set, so this run is the only chance to
+/// clear it and it cleared nothing. Refuse (exit 4) rather than apply
+/// past a file nobody could evaluate — the conservative direction, and
+/// the same one an unreadable or unparseable candidate takes.
+#[test]
+fn an_over_cap_drifted_candidate_refuses_scope_drift_exit_4() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
+
+    let (sha8, v) = plan_match(r, "fetch_config($$$A)", "load_config($$$A)");
+    assert_eq!(v["sites"], 1);
+
+    let a_before = std::fs::read(r.join("a.rs")).unwrap();
+
+    // A rust file too large to read appears after the plan — in the
+    // selector's scope, outside the named set, absent from the
+    // certificate. Sparse, so the fixture costs no real disk.
+    let big = std::fs::File::create(r.join("big.rs")).unwrap();
+    big.set_len(velocity_code_query::MAX_SEARCH_FILE_BYTES + 1)
+        .unwrap();
+    drop(big);
+
+    let out = vc(r)
+        .args(["apply", &sha8])
+        .assert()
+        .code(4)
+        .get_output()
+        .stderr
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.starts_with("scope-drift: "),
+        "a candidate that cannot be evaluated cannot be cleared: {text}"
+    );
+    assert!(
+        text.contains("big.rs"),
+        "the refusal names the candidate: {text}"
+    );
+    // Load-bearing: it must refuse for the SIZE, not incidentally. A
+    // sparse fixture is also not valid UTF-8, so with no size bound at
+    // all this same file still refuses — via the utf-8 warning — and the
+    // test would pass while pinning nothing about the cap. Naming the
+    // reason is what makes it discriminating. Either size gate satisfies
+    // it: the stat gate ("exceeds the N-byte match limit") in the ordinary
+    // case, and the probe-byte gate ("grew past the N-byte match limit")
+    // when the file wins the race.
+    assert!(
+        text.contains("match limit"),
+        "the refusal is for the size, not the encoding: {text}"
+    );
+    assert!(
+        text.contains(&format!("next: vc plan refresh {sha8}")),
+        "the hint is the caller's real next step: {text}"
+    );
+
+    let a_after = std::fs::read(r.join("a.rs")).unwrap();
+    assert_eq!(a_before, a_after, "kernel apply must never have run");
+}

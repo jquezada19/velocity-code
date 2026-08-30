@@ -342,23 +342,32 @@ impl Plan {
             if crate::lang_tag(&rel) != selector.lang {
                 continue;
             }
-            // Reaching this means the scope walk just saw a file the match
-            // pass did not read — i.e. the file APPEARED between the two,
-            // mid-planning. It is not a caller bug in the usual sense, and
-            // the old message ("no content supplied") described the symptom
-            // as if it were one. It stays `Usage` because the caller's
-            // action is the same as for any other malformed request — re-run
-            // the command — and because the alternative kinds all claim
-            // something untrue: nothing is `Stale` (no plan exists yet),
-            // nothing has drifted from a stored selector, and the file is
-            // present, not `NotFound`.
+            // Reaching this means the scope walk saw a file the match pass
+            // did not READ. Two ways in, and the message names both rather
+            // than asserting the one it cannot distinguish from here: the
+            // file appeared between the two passes, mid-planning; or the
+            // matcher declined to read it because it is over the size cap
+            // (`velocity_code_kernel::MAX_SEARCH_FILE_BYTES`), in which case
+            // its own warning has already said so with the size. Either
+            // way the fact this refusal rests on is the same one, and it is
+            // the fact that matters: there are no bytes from the selector's
+            // own read to hash, and a certificate built from anything else
+            // is the plan-time race this whole discipline exists to close.
+            //
+            // It stays `Usage` because the caller's action is the same as
+            // for any other malformed request — re-run the command, or take
+            // the file out of scope — and because the alternative kinds all
+            // claim something untrue: nothing is `Stale` (no plan exists
+            // yet), nothing has drifted from a stored selector, and the
+            // file is present, not `NotFound`.
             let content = content_by_path.get(&rel).ok_or_else(|| {
                 VcError::new(
                     ErrorKind::Usage,
                     format!(
-                        "{}: appeared in the selector's scope during planning, after \
-                         the match pass read it — the certificate can only be built \
-                         from the bytes the selector actually read",
+                        "{}: in the selector's scope but not read by the match pass \
+                         (it appeared mid-planning, or exceeds the read limit) — the \
+                         certificate can only be built from the bytes the selector \
+                         actually read",
                         rel.display()
                     ),
                 )

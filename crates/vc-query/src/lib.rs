@@ -33,29 +33,15 @@ pub struct QueryHit {
 /// the first 8KiB marks the file as binary.
 const BINARY_SNIFF_LEN: usize = 8192;
 
-/// Largest file the content-search paths (`search_literal`/`search_regex`)
-/// will read whole. A file above this is skipped with a warning rather
-/// than materialized.
+/// Largest file any read path here will pull into memory whole — the ONE
+/// definition, re-exported from the kernel so `velocity_code_query::
+/// MAX_SEARCH_FILE_BYTES` keeps naming it.
 ///
-/// Content search reads each candidate entirely into memory to run the
-/// scan over one contiguous buffer, so the peak cost of a query is set by
-/// the largest file in scope, not by anything the caller asked for. A
-/// multi-gigabyte artifact that happens to live in the tree — a vendored
-/// blob, a checked-in dump, a database file — would otherwise be read in
-/// full just to (almost certainly) fail the binary sniff. 16 MiB is far
-/// above any plausible hand-written source file and far below the point
-/// where reading one costs real memory.
-///
-/// The skip is reported, never silent: an unsearched file is a gap in the
-/// answer, and the caller has to be able to see it.
-///
-/// Public because the structural paths need the SAME number: the AST
-/// matcher (`velocity_code_select::match_sites`) reads every file it is
-/// handed, whole, and deliberately retains every buffer for the
-/// certificate's single-read discipline — so the gate has to live at its
-/// callers, and there must be exactly one definition of "too big to read"
-/// across every read verb rather than two that can drift.
-pub const MAX_SEARCH_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// It lives in `vc-kernel` rather than here because the AST matcher
+/// (`velocity_code_select::match_sites`) bounds its own reads by the same
+/// number, and this crate already depends on `vc-select` — so the shared
+/// home has to sit below both. See the kernel's definition for the policy.
+pub use velocity_code_kernel::MAX_SEARCH_FILE_BYTES;
 
 /// Longest `line_text` a [`QueryHit`] will carry, in bytes of the source
 /// line. A hit past this is rendered as a window CENTERED on the match
@@ -196,6 +182,69 @@ fn read_for_search(full: &Path, rel: &Path, warnings: &mut Vec<String>) -> Optio
         return None;
     }
     Some(bytes)
+}
+
+/// Read one symbol-search candidate as source text, bounded at
+/// [`MAX_SEARCH_FILE_BYTES`].
+///
+/// `None` means skipped, with the reason pushed onto `warnings` — there is
+/// no silent skip on this path at all (no binary sniff: a file the *index*
+/// tagged with a symbol language is a source file by construction, and a
+/// NUL in it is a surprise worth a parse warning rather than a silent
+/// drop).
+///
+/// Same **open once, then bound** discipline as [`read_for_search`]: the
+/// handle supplies both the size and the bytes, and the read is capped at
+/// `MAX + 1` so a file that grows past the cap after being sized is
+/// skipped rather than parsed from a truncated buffer. Truncation here
+/// would be quietly wrong in a way the caller could not see — a symbol
+/// table parsed from most of a file reports real names at real line
+/// numbers, with the tail's symbols simply absent.
+fn read_capped_source(full: &Path, rel: &Path, warnings: &mut Vec<String>) -> Option<String> {
+    let mut file = match fs::File::open(full) {
+        Ok(f) => f,
+        Err(e) => {
+            warnings.push(format!("{}: skipped — {e}", rel.display()));
+            return None;
+        }
+    };
+    let len = match file.metadata() {
+        Ok(md) => md.len(),
+        Err(e) => {
+            warnings.push(format!("{}: skipped — {e}", rel.display()));
+            return None;
+        }
+    };
+    if len > MAX_SEARCH_FILE_BYTES {
+        warnings.push(format!(
+            "{}: skipped — {len} bytes exceeds the {MAX_SEARCH_FILE_BYTES}-byte search limit",
+            rel.display()
+        ));
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(len as usize);
+    if let Err(e) = (&mut file)
+        .take(MAX_SEARCH_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+    {
+        warnings.push(format!("{}: skipped — {e}", rel.display()));
+        return None;
+    }
+    if bytes.len() as u64 > MAX_SEARCH_FILE_BYTES {
+        warnings.push(format!(
+            "{}: skipped — grew past the {MAX_SEARCH_FILE_BYTES}-byte search limit while being read",
+            rel.display()
+        ));
+        return None;
+    }
+    match String::from_utf8(bytes) {
+        Ok(s) => Some(s),
+        Err(_) => {
+            warnings.push(format!("{}: skipped — not valid utf-8", rel.display()));
+            None
+        }
+    }
 }
 
 fn sort_hits(hits: &mut [QueryHit]) {
@@ -365,8 +414,12 @@ const SYMBOL_LANGS: &[&str] = &["rust"];
 /// appended to the returned warnings instead of aborting the whole search.
 /// An unreadable or non-UTF8 file is skipped the same way — warned, not
 /// silently dropped — matching what `search_literal`/`search_regex` now do
-/// for their own skips. A file the search could not look at is a gap in
-/// the answer, and the caller has to be able to see it.
+/// for their own skips. So is a file over [`MAX_SEARCH_FILE_BYTES`]: the
+/// read here is bounded exactly as the content-search read is (see
+/// [`read_capped_source`]), so `--symbol` cannot be the one door through
+/// which a multi-gigabyte file is materialized whole. A file the search
+/// could not look at is a gap in the answer, and the caller has to be able
+/// to see it.
 ///
 /// Two-tier match: an exact-name match (`symbol.name == name`) wins over a
 /// case-insensitive substring match of `name` within `symbol.name` (fuzzy
@@ -415,15 +468,11 @@ pub fn search_symbol(
             continue;
         }
         let full = root.join(rel);
-        let src = match fs::read_to_string(&full) {
-            Ok(s) => s,
-            // Unreadable or non-UTF8 (e.g. a broken symlink race) — skip,
-            // not fatal, but never silently: same policy as
-            // search_literal/search_regex.
-            Err(e) => {
-                warnings.push(format!("{}: skipped — {e}", rel.display()));
-                continue;
-            }
+        // Unreadable, non-UTF8 (e.g. a broken symlink race), or over the
+        // size cap — skip, not fatal, but never silently: same policy and
+        // the same bound as search_literal/search_regex.
+        let Some(src) = read_capped_source(&full, rel, &mut warnings) else {
+            continue;
         };
         let syms = match velocity_code_lang::symbols(&src, &entry.lang) {
             Ok(s) => s,
@@ -472,9 +521,13 @@ pub fn search_symbol(
 /// contract `match_sites` itself documents) — the CLI does this via the
 /// shared lang-inference pipeline `plan match` uses. Returns `(hits,
 /// warnings)`: `warnings` is `match_sites`'s own per-file skip
-/// diagnostics (not valid UTF-8, or a parse tree containing an error),
-/// passed through unchanged for the caller to surface exactly like
-/// `plan match`'s `plan.warnings` and `search_symbol`'s `warnings` do.
+/// diagnostics (not valid UTF-8, a parse tree containing an error, or a
+/// file over [`MAX_SEARCH_FILE_BYTES`]), passed through unchanged for the
+/// caller to surface exactly like `plan match`'s `plan.warnings` and
+/// `search_symbol`'s `warnings` do.
+///
+/// Bounded like every other search mode: past the hit cap this REFUSES
+/// (`Usage`) rather than returning a partial answer.
 pub fn search_ast(
     root: &Path,
     pattern: &str,
@@ -486,9 +539,10 @@ pub fn search_ast(
 
     let mut hits = Vec::with_capacity(sites.len());
     for site in &sites {
-        // `match_sites` only omits a file from `content_by_path` when it
-        // produced zero sites — every site's own path is guaranteed
-        // present, so this is a defensive skip, never expected to fire.
+        // `match_sites` omits a file from `content_by_path` only when it
+        // never read it (over the size cap), and such a file produces no
+        // sites — every site's own path is guaranteed present, so this is
+        // a defensive skip, never expected to fire.
         let Some(bytes) = content_by_path.get(&site.path) else {
             continue;
         };
@@ -500,6 +554,13 @@ pub fn search_ast(
             col,
             line_text,
         });
+        // The same cap the literal and regex paths enforce, for the same
+        // reason: the hit vector is built in full before `--budget` sees
+        // it, so an unbounded structural match count is an out-of-memory
+        // shape. `--ast` is not exempt just because its hits come from a
+        // matcher rather than a scan — a broad pattern over a large tree
+        // amplifies exactly as a short needle does. Fail closed.
+        refuse_if_over_hit_cap(hits.len())?;
     }
     // `match_sites` sorts by `(path, start)`; re-sort by `(path, line,
     // col)` to guarantee the same ordering contract `search_literal`/
@@ -554,24 +615,69 @@ fn is_utf8_boundary(b: u8) -> bool {
 /// A line at or under [`MAX_LINE_TEXT_BYTES`] is returned whole. Longer,
 /// the window is centered on the match (so the match itself is visible
 /// even at the far end of a megabyte-long line), pushed back inside the
-/// line at either edge, then shrunk to UTF-8 sequence boundaries.
+/// line at either edge, then nudged to UTF-8 sequence boundaries — by at
+/// most [`MAX_UTF8_SEQ_BYTES`] per edge, which is what keeps the nudge
+/// from eating the window on bytes that are not UTF-8 at all (see
+/// [`nudge_start`]).
 fn clamp_line_window(line: &[u8], match_off: usize) -> (&[u8], bool) {
     if line.len() <= MAX_LINE_TEXT_BYTES {
         return (line, false);
     }
     let half = MAX_LINE_TEXT_BYTES / 2;
     let mut start = match_off.saturating_sub(half);
-    let mut end = (start + MAX_LINE_TEXT_BYTES).min(line.len());
+    let end = (start + MAX_LINE_TEXT_BYTES).min(line.len());
     // Reclaim the width lost when the window ran off the end of the line.
     start = end.saturating_sub(MAX_LINE_TEXT_BYTES);
 
-    while start < end && !is_utf8_boundary(line[start]) {
-        start += 1;
-    }
-    while end > start && end < line.len() && !is_utf8_boundary(line[end]) {
-        end -= 1;
-    }
+    let start = nudge_start(line, start, end);
+    let end = nudge_end(line, start, end);
     (&line[start..end], true)
+}
+
+/// The longest a single UTF-8 sequence can be. A boundary in genuinely
+/// UTF-8 text is therefore always within 3 bytes of any offset, so a scan
+/// this long either finds one or proves the bytes are not UTF-8 here.
+const MAX_UTF8_SEQ_BYTES: usize = 4;
+
+/// The first UTF-8 sequence boundary at or after `start`, searching at
+/// most [`MAX_UTF8_SEQ_BYTES`] and never past `end` — falling back to
+/// `start` itself when there is none.
+///
+/// The fallback is the point. The unbounded walk this replaces would march
+/// `start` forward for as long as it kept seeing continuation bytes, which
+/// on a long line of non-UTF-8 bytes (latin-1 text, a binary-ish blob that
+/// passed the NUL sniff) is the entire window: `start` reaches `end`, the
+/// window is empty, and the hit renders as a bare `…` with the match
+/// nowhere in it. Keeping the raw edge instead costs at most one
+/// replacement character from the lossy conversion — and a lossy edge that
+/// SHOWS the match beats a clean window that shows nothing.
+fn nudge_start(line: &[u8], start: usize, end: usize) -> usize {
+    let mut i = start;
+    while i < end && i - start < MAX_UTF8_SEQ_BYTES {
+        if is_utf8_boundary(line[i]) {
+            return i;
+        }
+        i += 1;
+    }
+    start
+}
+
+/// The last UTF-8 sequence boundary at or before the exclusive `end`,
+/// searching at most [`MAX_UTF8_SEQ_BYTES`] and never below `start` —
+/// falling back to `end` itself when there is none, for the same reason
+/// [`nudge_start`] falls back.
+///
+/// `end == line.len()` is always a boundary: there is no next sequence to
+/// cut into.
+fn nudge_end(line: &[u8], start: usize, end: usize) -> usize {
+    let mut i = end;
+    while i > start && end - i < MAX_UTF8_SEQ_BYTES {
+        if i == line.len() || is_utf8_boundary(line[i]) {
+            return i;
+        }
+        i -= 1;
+    }
+    end
 }
 
 #[cfg(test)]
@@ -1157,6 +1263,150 @@ mod tests {
             got,
             vec![("a.rs".into(), 1), ("a.rs".into(), 1), ("b.rs".into(), 1)]
         );
+    }
+
+    /// The matcher's internal size bound, seen from `--ast`'s side: an
+    /// over-cap file in scope is reported through the SAME warnings
+    /// channel every other skip uses, and does not fail the query.
+    ///
+    /// This calls `search_ast` directly with the over-cap file in scope,
+    /// which is precisely what the CLI's pre-filter would have removed —
+    /// that pre-filter stats the tree and then reopens it, so a file
+    /// growing past the cap inside that window arrives here anyway. The
+    /// pre-filter buys the friendlier early message; this is the net under
+    /// it, and the net is what this test pins.
+    #[test]
+    fn ast_search_reports_an_over_cap_file_through_the_warnings_channel() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
+        // Sparse, so the fixture costs no real disk.
+        let big = std::fs::File::create(d.path().join("big.rs")).unwrap();
+        big.set_len(MAX_SEARCH_FILE_BYTES + 1).unwrap();
+        drop(big);
+
+        let (hits, warnings) = search_ast(
+            d.path(),
+            "fetch_config($$$A)",
+            "rust",
+            &[PathBuf::from("a.rs"), PathBuf::from("big.rs")],
+        )
+        .unwrap();
+
+        assert_eq!(hits.len(), 1, "the in-cap file is still searched: {hits:?}");
+        assert_eq!(hits[0].path, PathBuf::from("a.rs"));
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert!(warnings[0].contains("big.rs"), "{}", warnings[0]);
+        assert!(
+            warnings[0].contains("exceeds"),
+            "the warning says why: {}",
+            warnings[0]
+        );
+    }
+
+    /// `--symbol` must not be the one door through which an unbounded
+    /// whole-file read still happens. An over-cap file is skipped with a
+    /// warning, and the rest of the tree is searched normally.
+    #[test]
+    fn an_over_cap_file_is_skipped_by_symbol_search_with_a_warning() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.rs"), "fn target() {}\n").unwrap();
+        // Sparse, so the fixture costs no real disk. It is indexed as
+        // rust, so `search_symbol` would otherwise read all of it.
+        let big = std::fs::File::create(d.path().join("big.rs")).unwrap();
+        big.set_len(MAX_SEARCH_FILE_BYTES + 1).unwrap();
+        drop(big);
+
+        let (hits, fuzzy, warnings) = search_symbol(d.path(), "target", &[]).unwrap();
+
+        assert!(!fuzzy);
+        assert_eq!(hits.len(), 1, "the other file is still searched: {hits:?}");
+        assert_eq!(hits[0].path, PathBuf::from("a.rs"));
+        assert_eq!(hits[0].symbol.name, "target");
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert!(warnings[0].contains("big.rs"), "{}", warnings[0]);
+        assert!(
+            warnings[0].contains("exceeds"),
+            "the skip is reported with its reason: {}",
+            warnings[0]
+        );
+    }
+
+    /// The clamp's boundary walk must not eat the window on bytes that are
+    /// not UTF-8 at all.
+    ///
+    /// The fixture is a long line of CONTINUATION bytes (`0x80`), which
+    /// contain no UTF-8 sequence boundary anywhere, with an ASCII needle
+    /// in the middle. The unbounded walk this pins would push `start`
+    /// forward until it found a boundary — reaching the needle — and pull
+    /// `end` back until it found one — reaching the needle from the other
+    /// side — collapsing the window to nothing: the hit rendered as a bare
+    /// `…`, with the match it was centered on nowhere in it.
+    ///
+    /// Bounded to one sequence's worth of scan, neither edge moves, and
+    /// the raw window survives to the lossy conversion. Replacement
+    /// characters at the edges are the accepted cost: a lossy window that
+    /// SHOWS the match beats a clean window that shows nothing.
+    #[test]
+    fn the_clamp_window_survives_bytes_that_are_not_utf8_at_all() {
+        let d = tempfile::tempdir().unwrap();
+        let mut content = vec![0x80u8; 1000];
+        content.extend_from_slice(b"NEEDLE");
+        content.extend(std::iter::repeat_n(0x80u8, 1000));
+        content.push(b'\n');
+        // No NUL, so this is not skipped as binary — it is simply not
+        // valid UTF-8, which is a real shape (latin-1 source, a minified
+        // blob) and not a contrived one.
+        std::fs::write(d.path().join("latin.txt"), &content).unwrap();
+
+        let (hits, _) = search_literal(d.path(), "NEEDLE", &[]).unwrap();
+        assert_eq!(hits.len(), 1);
+        let text = &hits[0].line_text;
+
+        assert!(
+            text.contains("NEEDLE"),
+            "the match must still be visible in the window: {text:?}"
+        );
+        assert_ne!(text, "…", "the window must not collapse to just the marker");
+        assert_eq!(
+            hits[0].col, 1001,
+            "col is the true byte column, unaffected by the clamp"
+        );
+    }
+
+    /// `--ast` is bounded by the same hit cap the literal and regex paths
+    /// are. Its hits are built in full before `--budget` can trim them, so
+    /// a broad structural pattern over a large tree amplifies exactly as a
+    /// short needle does — and a partial answer that looks complete is the
+    /// failure this refuses. Exercised through the test-only cap override
+    /// so the fixture stays small.
+    #[test]
+    fn an_ast_search_past_the_hit_cap_refuses_instead_of_answering_partially() {
+        let d = tempfile::tempdir().unwrap();
+        let mut src = String::from("fn main() {\n");
+        for i in 0..20 {
+            src.push_str(&format!("    fetch_config(a{i});\n"));
+        }
+        src.push_str("}\n");
+        std::fs::write(d.path().join("many.rs"), src).unwrap();
+        let scope = [PathBuf::from("many.rs")];
+
+        let err = with_hit_cap(5, || {
+            search_ast(d.path(), "fetch_config($$$A)", "rust", &scope).unwrap_err()
+        });
+        assert_eq!(err.kind, velocity_code_kernel::ErrorKind::Usage);
+        assert!(
+            err.message.contains("too many hits (>5)"),
+            "{}",
+            err.message
+        );
+        assert!(err.next.is_some(), "a refusal needs a hint");
+
+        // The control: exactly at the cap is still an answer, not a
+        // refusal — the refusal fires on EXCEEDING it.
+        let (hits, _) = with_hit_cap(20, || {
+            search_ast(d.path(), "fetch_config($$$A)", "rust", &scope).unwrap()
+        });
+        assert_eq!(hits.len(), 20);
     }
 
     #[test]
