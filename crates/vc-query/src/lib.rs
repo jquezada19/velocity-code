@@ -879,6 +879,73 @@ mod tests {
         assert!(!hits.is_empty());
     }
 
+    /// Build a fixture whose only NUL byte sits at exactly `nul_at`, with
+    /// a searchable `NEEDLE` on its own line AFTER the sniff window.
+    ///
+    /// Layout: one long line of `a`, then a line of `b` sized so the NUL
+    /// lands where asked, then `NEEDLE here`. Every offset is asserted,
+    /// not assumed — the whole point of the fixture is the exact byte.
+    fn nul_at_offset_fixture(nul_at: usize) -> Vec<u8> {
+        let mut v = vec![b'a'; 8100];
+        v.push(b'\n');
+        assert!(nul_at > v.len());
+        v.extend(std::iter::repeat_n(b'b', nul_at - v.len()));
+        v.push(0u8);
+        assert_eq!(v.len() - 1, nul_at, "the NUL must sit at byte {nul_at}");
+        v.push(b'\n');
+        v.extend_from_slice(b"NEEDLE here\n");
+        v
+    }
+
+    /// The `take(BINARY_SNIFF_LEN)` + `read_to_end` seam, crossed from
+    /// both sides. The sniff window is the first 8192 bytes — indices
+    /// 0..=8191 — so a NUL at 8191 is INSIDE it and a NUL at 8192 is
+    /// not, and the two must land on opposite sides of the binary skip.
+    ///
+    /// The second case also pins the resume-no-gap property: after the
+    /// sniff read, the remainder is read from the same handle at the
+    /// position `take` left it, so no byte is skipped and none is read
+    /// twice. A gap or an overlap there would move every subsequent
+    /// offset, so the `NEEDLE` past the boundary is found at exactly the
+    /// right line and column or not at all.
+    #[test]
+    fn the_binary_sniff_boundary_is_exactly_8192_bytes() {
+        let d = tempfile::tempdir().unwrap();
+
+        // Inside the window: binary, skipped silently (rg's own policy).
+        let inside = d.path().join("inside.dat");
+        std::fs::write(&inside, nul_at_offset_fixture(8191)).unwrap();
+        let mut warnings = Vec::new();
+        assert!(
+            read_for_search(&inside, Path::new("inside.dat"), &mut warnings).is_none(),
+            "a NUL at byte 8191 is inside the sniff window"
+        );
+        assert!(warnings.is_empty(), "binary skips are silent: {warnings:?}");
+
+        // One byte past it: not binary, fully searched.
+        let outside = d.path().join("outside.dat");
+        let content = nul_at_offset_fixture(8192);
+        std::fs::write(&outside, &content).unwrap();
+        let mut warnings = Vec::new();
+        let read_back = read_for_search(&outside, Path::new("outside.dat"), &mut warnings).unwrap();
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert_eq!(
+            read_back, content,
+            "the remainder resumes exactly where the sniff window ended — \
+             no byte skipped, none read twice"
+        );
+
+        // ...and the match past the boundary is located exactly.
+        let d2 = tempfile::tempdir().unwrap();
+        std::fs::write(d2.path().join("outside.dat"), &content).unwrap();
+        let (hits, warnings) = search_literal(d2.path(), "NEEDLE", &[]).unwrap();
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].line, 3, "line 1 is the `a`s, line 2 holds the NUL");
+        assert_eq!(hits[0].col, 1);
+        assert_eq!(hits[0].line_text, "NEEDLE here");
+    }
+
     /// The bound `read_for_search` promises: whatever it returns is at
     /// most [`MAX_SEARCH_FILE_BYTES`], and a file already past the cap is
     /// skipped outright rather than returned truncated (a truncated buffer
