@@ -140,7 +140,23 @@ impl Plan {
     /// state before touching anything, so `build` itself does not need to
     /// be race-free — it's the plan's honest opinion of "now", checked
     /// again at apply time.
+    ///
+    /// `form` must be `Edit` or `Import`. `Match` is refused (`Usage`):
+    /// this constructor produces no selector and no certificate, so a
+    /// match-form plan built here would be exactly the malformed shape
+    /// `validate_form`, `check_scope_drift` and `plan refresh` all guard
+    /// against — a plan that declares a selector's authority while
+    /// carrying nothing the drift check can verify. `build_match` is the
+    /// only way to make one, and this closes the last construction path
+    /// that could have made a different one.
     pub fn build(root: &Path, form: PlanForm, reqs: &[resolve::EditRequest]) -> VcResult<Plan> {
+        if form == PlanForm::Match {
+            return Err(VcError::new(
+                ErrorKind::Usage,
+                "Plan::build cannot build a match-form plan — it has no selector or certificate",
+            )
+            .with_next("use Plan::build_match"));
+        }
         let root_real = root
             .canonicalize()
             .map_err(|e| VcError::new(ErrorKind::Io, format!("{}: {e}", root.display())))?;
@@ -796,6 +812,37 @@ mod tests {
         assert_eq!(p.root_real, r.canonicalize().unwrap());
         assert!(p.realpaths.contains_key(&PathBuf::from("a.rs")));
         assert!(!p.epoch.is_empty());
+    }
+
+    /// `Plan::build` produces neither a selector nor a certificate, so a
+    /// match-form plan built through it would be precisely the malformed
+    /// shape `validate_form` and the apply-time drift check exist to
+    /// refuse — a plan claiming a selector's authority with nothing the
+    /// drift check can verify. Refuse at construction instead: this was
+    /// the last path that could produce one.
+    #[test]
+    fn build_refuses_to_construct_a_match_form_plan() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().to_path_buf();
+        std::fs::create_dir_all(r.join(".vc")).unwrap();
+        std::fs::write(r.join("a.rs"), "fn one() {}\n").unwrap();
+
+        let reqs = vec![resolve::EditRequest {
+            path: "a.rs".into(),
+            old: b"one".to_vec(),
+            new: b"uno".to_vec(),
+            line_hint: None,
+        }];
+
+        let err = Plan::build(&r, PlanForm::Match, &reqs).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(err.message.contains("match-form"), "got: {}", err.message);
+        assert_eq!(err.next.as_deref(), Some("use Plan::build_match"));
+
+        // The controls: the two forms this constructor DOES build.
+        for form in [PlanForm::Edit, PlanForm::Import] {
+            assert!(Plan::build(&r, form, &reqs).is_ok());
+        }
     }
 
     #[test]

@@ -46,6 +46,23 @@
 # (`^fn`, `\}$`) to exercise this; there is no known regex-semantics
 # divergence left between vc and rg for this query list.
 set -uo pipefail
+
+# This gate IS the rg comparison — without a real `rg` on PATH there is
+# nothing to compare against, and every query would fall into the "rg
+# errored" branch with an opaque 127. Say so once, up front. (`command -v`
+# also matches a shell alias or function shadowing the name, which is how
+# this bit on a dev box whose `rg` was an unrelated shim: the version
+# probe below is what actually establishes a real ripgrep binary.)
+if ! command -v rg >/dev/null 2>&1 || ! rg --version >/dev/null 2>&1; then
+  echo "R1 lexical parity: SKIPPED — no working \`rg\` binary on PATH" >&2
+  echo "this gate compares vc against ripgrep; install ripgrep and re-run" >&2
+  exit 2
+fi
+if ! command -v jq >/dev/null 2>&1; then
+  echo "R1 lexical parity: SKIPPED — no \`jq\` on PATH (needed to parse vc --json)" >&2
+  exit 2
+fi
+
 corpus="$(cd "$(dirname "$0")/corpus" && pwd)"
 queries="$(dirname "$0")/queries_lexical.txt"
 

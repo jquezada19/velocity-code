@@ -376,3 +376,56 @@ fn edit_form_plan_skips_the_drift_check_entirely() {
         "fn new_name() {}\n"
     );
 }
+
+/// A drifted candidate the matcher cannot EVALUATE must still fail
+/// closed with the drift verdict, not leak the matcher's own exit code.
+///
+/// Here `b.rs` is outside the plan's named set and gains a NESTED match
+/// (`fetch_config(fetch_config(z))`), which `match_sites` refuses as an
+/// `overlap` (exit 1). But the fact being reported is about the TREE, not
+/// about the pattern: a candidate outside the named set that could not be
+/// cleared is exactly what scope-drift means, the kernel's stale check
+/// will never look at it, and the caller's next step is `vc plan refresh`
+/// — so exit 4, with the underlying reason preserved in the message.
+#[test]
+fn a_drifted_candidate_the_matcher_cannot_evaluate_refuses_scope_drift_exit_4() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
+    std::fs::write(r.join("b.rs"), "fn other() {}\n").unwrap();
+
+    let (sha8, v) = plan_match(r, "fetch_config($$$A)", "load_config($$$A)");
+    assert_eq!(v["sites"], 1);
+
+    // b.rs drifts into a shape the matcher refuses to resolve.
+    std::fs::write(
+        r.join("b.rs"),
+        "fn other() { fetch_config(fetch_config(z)); }\n",
+    )
+    .unwrap();
+
+    let out = vc(r)
+        .args(["apply", &sha8])
+        .assert()
+        .code(4)
+        .get_output()
+        .stderr
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.starts_with("scope-drift: "),
+        "the verdict is about the tree, not the pattern: {text}"
+    );
+    assert!(
+        text.contains("b.rs"),
+        "the refusal names the candidate: {text}"
+    );
+    assert!(
+        text.contains("overlap"),
+        "the underlying reason is preserved: {text}"
+    );
+    assert!(
+        text.contains(&format!("next: vc plan refresh {sha8}")),
+        "the hint is the caller's real next step: {text}"
+    );
+}

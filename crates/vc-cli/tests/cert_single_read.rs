@@ -98,11 +98,18 @@ fn certificate_baselines_the_match_pass_read_not_a_later_one() {
     );
 }
 
-/// The other end of the same guarantee, at the CLI: an unmatched in-scope
-/// file that changes AFTER the plan is a file the drift check can still
-/// see, because the certificate recorded the pre-change bytes. (`b.rs`
-/// gains a match, which is the observable refusal; the certificate having
-/// baselined it correctly is what makes the comparison meaningful.)
+/// The structural precondition the drift check depends on: an in-scope
+/// file that matched NOTHING is still certified, and is still outside the
+/// plan's named set.
+///
+/// That combination is the whole reason the drift check exists — the
+/// kernel's stale check only ever looks at named files, so an unmatched
+/// in-scope file can be caught by nothing else. This test asserts only
+/// those two facts about the certificate; it plants no later change and
+/// runs no apply, so it does not itself demonstrate a refusal. The
+/// end-to-end refusal is `cli_scope_drift.rs`'s
+/// `a_new_match_outside_the_named_set_refuses_scope_drift_exit_4`, and
+/// the race that would defeat it is the test above.
 #[test]
 fn unmatched_scope_file_is_covered_by_the_certificate() {
     let d = tempfile::tempdir().unwrap();

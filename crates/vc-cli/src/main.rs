@@ -297,24 +297,42 @@ fn cmd_plan(root: &Path, cwd: &Path, form: &PlanCmd) -> VcResult<CmdOutcome> {
         }
         PlanCmd::Refresh { sha8 } => {
             let stale_plan = Plan::load(root, sha8)?;
-            match &stale_plan.selector {
+            // Branch on the plan's declared FORM, never on whether an
+            // optional half happens to be present — the same rule
+            // `check_scope_drift` follows. `Plan::load`'s `validate_form`
+            // already guarantees a match-form plan carries its selector,
+            // so the `None` arm below is unreachable defense in depth
+            // rather than a real case; keying off `selector.is_some()`
+            // instead would silently treat a malformed match plan as an
+            // edit plan and replay its stored edits with no selector
+            // check at all.
+            match stale_plan.form {
                 // Match-form: re-run the FULL pipeline from the stored
                 // selector (fresh walk, fresh match) instead of replaying
                 // stored edits — the stored edits alone can't surface a
                 // call site that only exists in the CURRENT tree. No
                 // `--expect` on a refresh: the whole point is to accept
                 // whatever the current tree now yields.
-                Some(sel) => plan_match_pipeline(
-                    root,
-                    &sel.paths,
-                    Some(sel.lang.as_str()),
-                    &sel.pattern,
-                    &sel.rewrite,
-                    None,
-                )?,
+                PlanForm::Match => {
+                    let sel = stale_plan.selector.as_ref().ok_or_else(|| {
+                        VcError::new(
+                            ErrorKind::Malformed,
+                            format!("plan {sha8}: match-form plan has no selector"),
+                        )
+                        .with_next(format!("vc show {sha8}"))
+                    })?;
+                    plan_match_pipeline(
+                        root,
+                        &sel.paths,
+                        Some(sel.lang.as_str()),
+                        &sel.pattern,
+                        &sel.rewrite,
+                        None,
+                    )?
+                }
                 // Edit/import-form: unchanged M1 behavior — re-resolve the
                 // stored old/new text against current content.
-                None => {
+                PlanForm::Edit | PlanForm::Import => {
                     let reqs = stale_plan
                         .edits
                         .iter()
@@ -732,8 +750,34 @@ fn check_scope_drift(root: &Path, sha8: &str) -> VcResult<()> {
         return Ok(());
     }
 
+    // A failure to EVALUATE a drifted candidate must fail closed with the
+    // drift verdict, not leak the matcher's own exit code. These
+    // candidates are outside `plan.files`, so the kernel's stale check
+    // never looks at them — this run is the only chance to clear them, and
+    // one that ends in an error has cleared nothing. Reporting `overlap`
+    // (exit 1) for that is doubly wrong: it names a fact about the
+    // pattern when the fact is about the tree, and it uses the exit code
+    // for "a fact about the content" when the caller's actual next step is
+    // `vc plan refresh`. `Usage` is the one kind passed through unchanged:
+    // a stored pattern that no longer parses IS a usage error, and no
+    // refresh fixes it. Every mapped kind (`Overlap`/`NotFound`/`Io`)
+    // already names the offending candidate in its own message, which is
+    // preserved verbatim.
     let (sites, _content_by_path, warnings) =
-        match_sites(root, &sel.pattern, &sel.rewrite, &sel.lang, &candidates)?;
+        match_sites(root, &sel.pattern, &sel.rewrite, &sel.lang, &candidates).map_err(
+            |e| match e.kind {
+                ErrorKind::Usage => e,
+                _ => VcError::new(
+                    ErrorKind::ScopeDrift,
+                    format!(
+                        "{} — a drifted candidate could not be verified against the \
+                         selector since plan",
+                        e.message
+                    ),
+                )
+                .with_next(format!("vc plan refresh {sha8}")),
+            },
+        )?;
 
     // A live match in a drifted, out-of-plan file: the canonical
     // "a site appeared where you weren't looking" refusal. Attribution

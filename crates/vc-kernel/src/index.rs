@@ -80,11 +80,27 @@ impl StatIndex {
         bytes.extend_from_slice(&INDEX_VERSION.to_le_bytes());
         bytes.extend_from_slice(&body);
 
+        // Every failure path after the temp file exists removes it. A
+        // temp left behind is not a correctness problem (the index is a
+        // cache, and `create_temp_file`'s names never collide with the
+        // real index path), but it is litter that accumulates in `.vc/`
+        // once per failed save with nothing that ever cleans it up —
+        // a full disk or a revoked permission would seed one per
+        // invocation. The cleanup is explicit rather than RAII: there are
+        // exactly three fallible steps and one owner, so a guard type
+        // would be more machinery than the three `remove_file` calls it
+        // replaces.
         let (tmp, mut f) = create_temp_file(&dir)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
+        let written = f.write_all(&bytes).and_then(|()| f.sync_all());
         drop(f);
-        std::fs::rename(&tmp, index_path(root))?;
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        if let Err(e) = std::fs::rename(&tmp, index_path(root)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         fsync_dir(&dir)?;
         Ok(())
     }
