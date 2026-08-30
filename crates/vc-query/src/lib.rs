@@ -10,6 +10,7 @@ pub use render::{Budgeted, render_hits, render_symbol_hits, symbol_kind_label, t
 use memchr::{memchr_iter, memmem};
 use regex::bytes::RegexBuilder;
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use velocity_code_kernel::index;
 use velocity_code_kernel::walk::walk_scoped;
@@ -32,28 +33,130 @@ pub struct QueryHit {
 /// the first 8KiB marks the file as binary.
 const BINARY_SNIFF_LEN: usize = 8192;
 
+/// Largest file the content-search paths (`search_literal`/`search_regex`)
+/// will read whole. A file above this is skipped with a warning rather
+/// than materialized.
+///
+/// Content search reads each candidate entirely into memory to run the
+/// scan over one contiguous buffer, so the peak cost of a query is set by
+/// the largest file in scope, not by anything the caller asked for. A
+/// multi-gigabyte artifact that happens to live in the tree — a vendored
+/// blob, a checked-in dump, a database file — would otherwise be read in
+/// full just to (almost certainly) fail the binary sniff. 16 MiB is far
+/// above any plausible hand-written source file and far below the point
+/// where reading one costs real memory.
+///
+/// The skip is reported, never silent: an unsearched file is a gap in the
+/// answer, and the caller has to be able to see it.
+const MAX_SEARCH_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read one candidate for content search, bounded at both ends.
+///
+/// Returns `None` when the file must be skipped, pushing an explanatory
+/// line onto `warnings` for every skip a caller could not otherwise
+/// predict (unreadable, over the size cap). A binary file is the one
+/// silent skip: it is the documented, expected behaviour of every content
+/// search here, exactly as it is for ripgrep, and warning per binary file
+/// would bury the real diagnostics.
+///
+/// Order matters. `metadata` gates the size before a single byte is read;
+/// then only the first [`BINARY_SNIFF_LEN`] bytes are read, and a binary
+/// file returns without ever pulling in the rest. Previously the whole
+/// file was read first and *then* sniffed, so a 40 MiB binary cost a full
+/// 40 MiB read to reach a decision that the first 8 KiB already settled.
+fn read_for_search(full: &Path, rel: &Path, warnings: &mut Vec<String>) -> Option<Vec<u8>> {
+    let md = match fs::metadata(full) {
+        Ok(md) => md,
+        Err(e) => {
+            warnings.push(format!("{}: skipped — {e}", rel.display()));
+            return None;
+        }
+    };
+    let len = md.len();
+    if len > MAX_SEARCH_FILE_BYTES {
+        warnings.push(format!(
+            "{}: skipped — {len} bytes exceeds the {MAX_SEARCH_FILE_BYTES}-byte search limit",
+            rel.display()
+        ));
+        return None;
+    }
+
+    let mut file = match fs::File::open(full) {
+        Ok(f) => f,
+        Err(e) => {
+            warnings.push(format!("{}: skipped — {e}", rel.display()));
+            return None;
+        }
+    };
+    let mut bytes = Vec::with_capacity(len.min(BINARY_SNIFF_LEN as u64) as usize);
+    if let Err(e) = (&mut file)
+        .take(BINARY_SNIFF_LEN as u64)
+        .read_to_end(&mut bytes)
+    {
+        warnings.push(format!("{}: skipped — {e}", rel.display()));
+        return None;
+    }
+    if bytes.contains(&0u8) {
+        return None;
+    }
+    // `take` consumed at most the sniff window; the handle is positioned
+    // right after it, so this reads the remainder without re-reading.
+    if let Err(e) = file.read_to_end(&mut bytes) {
+        warnings.push(format!("{}: skipped — {e}", rel.display()));
+        return None;
+    }
+    Some(bytes)
+}
+
+fn sort_hits(hits: &mut [QueryHit]) {
+    hits.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.line.cmp(&b.line))
+            .then(a.col.cmp(&b.col))
+    });
+}
+
 /// Literal (non-regex) search for `needle` across the files under `root`
 /// named by `scope` (empty = whole tree, per [`walk_scoped`]). Reads each
-/// file's bytes once and runs `memmem::find_iter` over the whole buffer,
-/// mapping match offsets to line/column via a per-file newline index built
-/// with `memchr_iter`. Files with a NUL byte in the first 8KiB are skipped
-/// as binary. Results are sorted by `(path, line, col)` and therefore
-/// deterministic.
-pub fn search_literal(root: &Path, needle: &str, scope: &[PathBuf]) -> VcResult<Vec<QueryHit>> {
+/// file's bytes once (bounded — see [`read_for_search`]) and runs
+/// `memmem::find_iter` over the whole buffer, mapping match offsets to
+/// line/column via a per-file newline index built with `memchr_iter`.
+/// Files with a NUL byte in the first 8KiB are skipped as binary. Results
+/// are sorted by `(path, line, col)` and therefore deterministic.
+///
+/// Returns `(hits, warnings)`: one warning line per file skipped without
+/// failing the search, for the caller to surface — the same contract
+/// `search_symbol` and `search_ast` already have, and what makes the
+/// "never silently skipped" claim true of every search mode rather than
+/// only of the two structural ones.
+///
+/// An EMPTY needle is refused (`Usage`). `memmem` reports an empty needle
+/// as matching at every byte position, so `vc query ""` produced one hit
+/// per byte of the tree, all of them materialized before any `--budget`
+/// could apply — an out-of-memory shape rather than an answer.
+pub fn search_literal(
+    root: &Path,
+    needle: &str,
+    scope: &[PathBuf],
+) -> VcResult<(Vec<QueryHit>, Vec<String>)> {
+    if needle.is_empty() {
+        return Err(VcError::new(
+            ErrorKind::Usage,
+            "empty pattern — it would match at every byte position in the tree",
+        )
+        .with_next("vc query <pattern>"));
+    }
     let files = walk_scoped(root, scope)?;
     let needle_bytes = needle.as_bytes();
     let mut hits = Vec::new();
+    let mut warnings = Vec::new();
 
     for rel in files {
         let full = root.join(&rel);
-        let bytes = match fs::read(&full) {
-            Ok(b) => b,
-            // Unreadable (e.g. a broken symlink race) — skip, not fatal.
-            Err(_) => continue,
-        };
-        if is_binary(&bytes) {
+        let Some(bytes) = read_for_search(&full, &rel, &mut warnings) else {
             continue;
-        }
+        };
 
         let newlines: Vec<usize> = memchr_iter(b'\n', &bytes).collect();
         for pos in memmem::find_iter(&bytes, needle_bytes) {
@@ -67,13 +170,8 @@ pub fn search_literal(root: &Path, needle: &str, scope: &[PathBuf]) -> VcResult<
         }
     }
 
-    hits.sort_by(|a, b| {
-        a.path
-            .cmp(&b.path)
-            .then(a.line.cmp(&b.line))
-            .then(a.col.cmp(&b.col))
-    });
-    Ok(hits)
+    sort_hits(&mut hits);
+    Ok((hits, warnings))
 }
 
 /// Regex search for `pattern` across the files under `root` named by
@@ -95,24 +193,41 @@ pub fn search_literal(root: &Path, needle: &str, scope: &[PathBuf]) -> VcResult<
 /// file, which is a real, silent divergence from rg on any anchored
 /// pattern. `\A`/`\z` remain available for whole-buffer anchoring when that
 /// is genuinely what's wanted.
-pub fn search_regex(root: &Path, pattern: &str, scope: &[PathBuf]) -> VcResult<Vec<QueryHit>> {
+///
+/// Returns `(hits, warnings)` on the same contract as [`search_literal`],
+/// and refuses (`Usage`) a pattern that MATCHES THE EMPTY STRING — `""`,
+/// `a*`, `(foo)?` and friends. Such a pattern has a match at every byte
+/// position, so the hit list is the size of the tree and is materialized
+/// in full before any `--budget` can trim it. The test is direct rather
+/// than syntactic: ask the compiled regex whether it matches `""`.
+pub fn search_regex(
+    root: &Path,
+    pattern: &str,
+    scope: &[PathBuf],
+) -> VcResult<(Vec<QueryHit>, Vec<String>)> {
     let re = RegexBuilder::new(pattern)
         .multi_line(true)
         .build()
         .map_err(|e| VcError::new(ErrorKind::Usage, e.to_string()))?;
+    if re.is_match(b"") {
+        return Err(VcError::new(
+            ErrorKind::Usage,
+            format!(
+                "pattern `{pattern}` matches the empty string — it would match at \
+                 every byte position in the tree"
+            ),
+        )
+        .with_next("vc query <pattern> --regex"));
+    }
     let files = walk_scoped(root, scope)?;
     let mut hits = Vec::new();
+    let mut warnings = Vec::new();
 
     for rel in files {
         let full = root.join(&rel);
-        let bytes = match fs::read(&full) {
-            Ok(b) => b,
-            // Unreadable (e.g. a broken symlink race) — skip, not fatal.
-            Err(_) => continue,
-        };
-        if is_binary(&bytes) {
+        let Some(bytes) = read_for_search(&full, &rel, &mut warnings) else {
             continue;
-        }
+        };
 
         let newlines: Vec<usize> = memchr_iter(b'\n', &bytes).collect();
         for m in re.find_iter(&bytes) {
@@ -126,13 +241,8 @@ pub fn search_regex(root: &Path, pattern: &str, scope: &[PathBuf]) -> VcResult<V
         }
     }
 
-    hits.sort_by(|a, b| {
-        a.path
-            .cmp(&b.path)
-            .then(a.line.cmp(&b.line))
-            .then(a.col.cmp(&b.col))
-    });
-    Ok(hits)
+    sort_hits(&mut hits);
+    Ok((hits, warnings))
 }
 
 /// One symbol-search match: a parsed [`velocity_code_lang::Symbol`] plus the
@@ -161,8 +271,10 @@ const SYMBOL_LANGS: &[&str] = &["rust"];
 /// (`ErrorKind::Malformed` — genuinely unparseable, non-blank source) is
 /// skipped, not fatal: its root-relative path plus the error message is
 /// appended to the returned warnings instead of aborting the whole search.
-/// An unreadable or non-UTF8 file is likewise skipped silently, matching
-/// `search_literal`/`search_regex`'s existing "unreadable -> skip" policy.
+/// An unreadable or non-UTF8 file is skipped the same way — warned, not
+/// silently dropped — matching what `search_literal`/`search_regex` now do
+/// for their own skips. A file the search could not look at is a gap in
+/// the answer, and the caller has to be able to see it.
 ///
 /// Two-tier match: an exact-name match (`symbol.name == name`) wins over a
 /// case-insensitive substring match of `name` within `symbol.name` (fuzzy
@@ -200,8 +312,12 @@ pub fn search_symbol(
         let src = match fs::read_to_string(&full) {
             Ok(s) => s,
             // Unreadable or non-UTF8 (e.g. a broken symlink race) — skip,
-            // not fatal, same policy as search_literal/search_regex.
-            Err(_) => continue,
+            // not fatal, but never silently: same policy as
+            // search_literal/search_regex.
+            Err(e) => {
+                warnings.push(format!("{}: skipped — {e}", rel.display()));
+                continue;
+            }
         };
         let syms = match velocity_code_lang::symbols(&src, &entry.lang) {
             Ok(s) => s,
@@ -293,11 +409,6 @@ pub fn search_ast(
     Ok((hits, warnings))
 }
 
-fn is_binary(bytes: &[u8]) -> bool {
-    let sniff_len = bytes.len().min(BINARY_SNIFF_LEN);
-    bytes[..sniff_len].contains(&0u8)
-}
-
 /// Maps a byte offset within `bytes` to `(1-based line, 1-based byte col,
 /// line text without trailing newline)`, given `newlines` — the sorted
 /// byte offsets of every `\n` in `bytes`.
@@ -324,7 +435,8 @@ mod tests {
         std::fs::create_dir_all(d.path().join(".vc")).unwrap();
         std::fs::write(d.path().join("b.rs"), "let alpha = 1;\nlet beta = alpha;\n").unwrap();
         std::fs::write(d.path().join("a.rs"), "fn alpha() {}\n").unwrap();
-        let hits = search_literal(d.path(), "alpha", &[]).unwrap();
+        let (hits, warnings) = search_literal(d.path(), "alpha", &[]).unwrap();
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
         let got: Vec<(String, usize)> = hits
             .iter()
             .map(|h| (h.path.display().to_string(), h.line))
@@ -343,7 +455,8 @@ mod tests {
         std::fs::write(d.path().join(".gitignore"), "gen.rs\n").unwrap();
         std::fs::write(d.path().join("gen.rs"), "let alpha = 1;\n").unwrap();
         std::fs::write(d.path().join("kept.rs"), "let alpha = 2;\n").unwrap();
-        let hits = search_literal(d.path(), "alpha", &[]).unwrap();
+        let (hits, warnings) = search_literal(d.path(), "alpha", &[]).unwrap();
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
         let paths: Vec<String> = hits.iter().map(|h| h.path.display().to_string()).collect();
         assert_eq!(paths, vec!["kept.rs".to_string()]);
     }
@@ -355,7 +468,8 @@ mod tests {
         bytes.push(0u8);
         bytes.extend_from_slice(b" more alpha");
         std::fs::write(d.path().join("bin.dat"), &bytes).unwrap();
-        let hits = search_literal(d.path(), "alpha", &[]).unwrap();
+        let (hits, warnings) = search_literal(d.path(), "alpha", &[]).unwrap();
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
         assert!(hits.is_empty());
     }
 
@@ -364,7 +478,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "fn alpha() {}\n").unwrap();
         std::fs::write(d.path().join("b.rs"), "fn beta() {}\n").unwrap();
-        let hits = search_regex(d.path(), "fn (alpha|beta)", &[]).unwrap();
+        let (hits, _) = search_regex(d.path(), "fn (alpha|beta)", &[]).unwrap();
         let got: Vec<(String, usize, usize)> = hits
             .iter()
             .map(|h| (h.path.display().to_string(), h.line, h.col))
@@ -378,7 +492,7 @@ mod tests {
     fn regex_search_one_hit_per_match_on_a_repeated_pattern() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "aa aa\n").unwrap();
-        let hits = search_regex(d.path(), "aa", &[]).unwrap();
+        let (hits, _) = search_regex(d.path(), "aa", &[]).unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].col, 1);
         assert_eq!(hits[1].col, 4);
@@ -398,7 +512,7 @@ mod tests {
         )
         .unwrap();
 
-        let starts = search_regex(d.path(), "^fn", &[]).unwrap();
+        let (starts, _) = search_regex(d.path(), "^fn", &[]).unwrap();
         let start_lines: Vec<usize> = starts.iter().map(|h| h.line).collect();
         assert_eq!(
             start_lines,
@@ -406,7 +520,7 @@ mod tests {
             "^ must match at the start of every line, not only the start of the file"
         );
 
-        let ends = search_regex(d.path(), ";$", &[]).unwrap();
+        let (ends, _) = search_regex(d.path(), ";$", &[]).unwrap();
         let end_lines: Vec<usize> = ends.iter().map(|h| h.line).collect();
         assert_eq!(
             end_lines,
@@ -431,7 +545,7 @@ mod tests {
         bytes.push(0u8);
         bytes.extend_from_slice(b" more alpha");
         std::fs::write(d.path().join("bin.dat"), &bytes).unwrap();
-        let hits = search_regex(d.path(), "alpha", &[]).unwrap();
+        let (hits, _) = search_regex(d.path(), "alpha", &[]).unwrap();
         assert!(hits.is_empty());
     }
 
@@ -444,7 +558,7 @@ mod tests {
         }
         std::fs::write(d.path().join("many.rs"), content).unwrap();
 
-        let hits = search_literal(d.path(), "hit", &[]).unwrap();
+        let (hits, _) = search_literal(d.path(), "hit", &[]).unwrap();
         assert_eq!(hits.len(), 100);
 
         let three_lines_text = hits[..3]
@@ -457,6 +571,109 @@ mod tests {
         let budgeted = render_hits(&hits, Some(budget));
         assert_eq!(budgeted.text, three_lines_text);
         assert_eq!(budgeted.elided, 97);
+    }
+
+    /// An empty literal needle matches at every byte position, so the hit
+    /// list would be the size of the tree — materialized in full, since
+    /// `--budget` only trims at render time. Refuse instead.
+    #[test]
+    fn empty_literal_pattern_is_refused_not_amplified() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.rs"), "fn alpha() {}\n").unwrap();
+
+        let err = search_literal(d.path(), "", &[]).unwrap_err();
+        assert_eq!(err.kind, velocity_code_kernel::ErrorKind::Usage);
+        assert!(err.message.contains("empty pattern"), "{}", err.message);
+
+        // The control: one byte of needle is fine.
+        let (hits, _) = search_literal(d.path(), "f", &[]).unwrap();
+        assert!(!hits.is_empty());
+    }
+
+    /// Same amplification through the regex door, which an emptiness check
+    /// on the pattern STRING would miss: `a*`, `(x)?` and `^` are all
+    /// non-empty patterns that match the empty string, and each yields one
+    /// hit per byte. The guard asks the compiled regex directly.
+    #[test]
+    fn regex_matching_the_empty_string_is_refused_not_amplified() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.rs"), "fn alpha() {}\n").unwrap();
+
+        for pattern in ["", "a*", "(alpha)?", "x{0,3}"] {
+            let err = search_regex(d.path(), pattern, &[]).unwrap_err();
+            assert_eq!(
+                err.kind,
+                velocity_code_kernel::ErrorKind::Usage,
+                "pattern {pattern:?} must be refused"
+            );
+            assert!(
+                err.message.contains("empty string"),
+                "pattern {pattern:?}: {}",
+                err.message
+            );
+        }
+
+        // The control: a pattern that cannot match empty still works.
+        let (hits, _) = search_regex(d.path(), "a+", &[]).unwrap();
+        assert!(!hits.is_empty());
+    }
+
+    /// A file past the size cap is skipped, and the skip is REPORTED. The
+    /// fixture is sparse (`set_len`), so it costs no real disk — the point
+    /// is that `metadata` decides before any read, so the body is never
+    /// materialized.
+    #[test]
+    fn oversized_file_is_skipped_with_a_warning() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("small.rs"), "fn alpha() {}\n").unwrap();
+        let big = std::fs::File::create(d.path().join("big.rs")).unwrap();
+        big.set_len(MAX_SEARCH_FILE_BYTES + 1).unwrap();
+        drop(big);
+
+        let (hits, warnings) = search_literal(d.path(), "alpha", &[]).unwrap();
+        assert_eq!(hits.len(), 1, "the small file is still searched: {hits:?}");
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert!(warnings[0].contains("big.rs"), "{}", warnings[0]);
+        assert!(
+            warnings[0].contains("exceeds"),
+            "the warning must say why: {}",
+            warnings[0]
+        );
+
+        // Regex mode is bounded by the same gate and reports the same way.
+        let (_, warnings) = search_regex(d.path(), "alpha", &[]).unwrap();
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert!(warnings[0].contains("big.rs"), "{}", warnings[0]);
+    }
+
+    /// A file the search could not read is a gap in the answer. Both
+    /// content modes must say so rather than skipping it silently — the
+    /// README's "never silently" claim covers every mode, not only the
+    /// structural ones.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_file_yields_a_warning_not_silence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("readable.rs"), "fn alpha() {}\n").unwrap();
+        let locked = d.path().join("locked.rs");
+        std::fs::write(&locked, "fn alpha() {}\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let literal = search_literal(d.path(), "alpha", &[]);
+        let regex = search_regex(d.path(), "alpha", &[]);
+
+        // Restore before any assertion can panic, so tempdir cleanup is
+        // never left at the mercy of a failing test.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        for (mode, result) in [("literal", literal), ("regex", regex)] {
+            let (hits, warnings) = result.unwrap();
+            assert_eq!(hits.len(), 1, "{mode}: the readable file still matches");
+            assert_eq!(warnings.len(), 1, "{mode} warnings: {warnings:?}");
+            assert!(warnings[0].contains("locked.rs"), "{mode}: {}", warnings[0]);
+        }
     }
 
     #[test]

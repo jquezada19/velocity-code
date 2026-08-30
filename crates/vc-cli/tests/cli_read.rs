@@ -92,9 +92,11 @@ fn outline_budget_elides_nested_lines_and_reports_count() {
 }
 
 /// Unsupported language (a `.txt` file, empty `lang_tag`) refuses with
-/// `Usage`, exit 2, pointing at `vc read`.
+/// `Usage`, exit 2. The remedy rides in `next:` per the error grammar, and
+/// names the actual file — a command the caller can copy and run, rather
+/// than prose telling them to work it out ("vc read the file instead").
 #[test]
-fn outline_unsupported_language_is_usage_error() {
+fn outline_unsupported_language_is_usage_error_with_a_runnable_next_hint() {
     let d = tempfile::tempdir().unwrap();
     let r = d.path();
     std::fs::write(r.join("notes.txt"), "hello\n").unwrap();
@@ -105,8 +107,9 @@ fn outline_unsupported_language_is_usage_error() {
         .failure()
         .code(2);
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
-    assert!(
-        stderr.contains("outline: unsupported language — vc read the file instead"),
+    assert_eq!(
+        stderr.trim_end(),
+        "usage: outline: unsupported language — next: vc read notes.txt",
         "got: {stderr}"
     );
 }
@@ -328,6 +331,169 @@ fn read_symbol_zero_hits_is_not_found() {
         .assert()
         .failure()
         .code(1);
+}
+
+/// A FUZZY-only result refuses instead of serving a different function's
+/// body. `search_symbol` falls back to a case-insensitive substring tier
+/// when nothing matches the name exactly, and `read` discarded that flag —
+/// so `vc read --symbol load_config`, in a tree with no `load_config` at
+/// all, printed `load_configuration_from_disk`'s body at exit 0, with
+/// nothing in the output saying it was a different function.
+///
+/// The refusal still has to be useful: the near-misses are listed as
+/// `path:line name`, and `next:` points at the verb that may answer
+/// fuzzily.
+#[test]
+fn read_symbol_fuzzy_only_match_refuses_instead_of_serving_a_near_miss() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(
+        r.join("config.rs"),
+        "fn load_configuration_from_disk() {\n    let v = 1;\n}\n",
+    )
+    .unwrap();
+
+    let assert = vc(r)
+        .args(["read", "--symbol", "load_config"])
+        .assert()
+        .failure()
+        .code(1);
+    let out = assert.get_output();
+    let stderr = String::from_utf8(out.stderr.clone()).unwrap();
+    let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+
+    assert!(stderr.starts_with("not-found:"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("load_config:"),
+        "the queried name must be named: {stderr}"
+    );
+    assert!(
+        stderr.contains("config.rs:1 load_configuration_from_disk"),
+        "candidates must be listed as `path:line name`: {stderr}"
+    );
+    assert!(
+        stderr.contains("next: vc query load_config --symbol"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("let v = 1"),
+        "the near-miss body must never be served: {stdout}"
+    );
+}
+
+/// The control for the refusal above: an EXACT match still reads normally.
+/// The fuzzy guard must not cost the ordinary case anything — here the
+/// same tree also holds a longer name containing the query as a substring,
+/// so the exact tier is what has to win.
+#[test]
+fn read_symbol_exact_match_still_reads_even_with_fuzzy_neighbours() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(
+        r.join("config.rs"),
+        "fn load_config() {\n    let exact = 1;\n}\nfn load_config_from_disk() {\n    let near = 2;\n}\n",
+    )
+    .unwrap();
+
+    let out = vc(r)
+        .args(["read", "--symbol", "load_config"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("let exact = 1"), "got: {text}");
+    assert!(
+        !text.contains("let near = 2"),
+        "the fuzzy neighbour must not be included: {text}"
+    );
+}
+
+/// CRLF line endings, pinned as the documented behaviour rather than left
+/// to be discovered: `read` is line-oriented — it splits with `str::lines`,
+/// which strips a trailing `\r` along with the `\n` — so a CRLF file comes
+/// back with `\n` endings and no carriage returns. `vc read` is not a
+/// byte-for-byte `cat`.
+#[test]
+fn read_of_a_crlf_file_returns_lines_with_carriage_returns_stripped() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("crlf.txt"), "one\r\ntwo\r\nthree\r\n").unwrap();
+
+    let out = vc(r)
+        .args(["--json", "read", "crlf.txt"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["start"], 1);
+    assert_eq!(v["end"], 3);
+    assert_eq!(
+        v["text"], "1: one\n2: two\n3: three",
+        "lines are returned \\r-stripped, joined with \\n"
+    );
+    assert!(
+        !v["text"].as_str().unwrap().contains('\r'),
+        "no carriage return survives the line-oriented read"
+    );
+}
+
+/// A file whose last line has no trailing newline: that line is still a
+/// line, returned intact and counted. `str::lines` yields it, so the
+/// final line is neither dropped nor merged with its predecessor.
+#[test]
+fn read_of_a_file_without_a_trailing_newline_keeps_the_last_line() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("no_eol.txt"), "one\ntwo\nlast line, no newline").unwrap();
+
+    let out = vc(r)
+        .args(["--json", "read", "no_eol.txt"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["end"], 3, "the unterminated last line still counts");
+    assert_eq!(v["text"], "1: one\n2: two\n3: last line, no newline");
+}
+
+/// The budget pre-check added for bounded reads gates a WHOLE-FILE read on
+/// the file's raw size, before the file is read. It must not leak into a
+/// RANGE read: a small range out of a large file is a legitimate request,
+/// and the range's own rendered text is what the budget applies to.
+#[test]
+fn budget_gates_a_whole_file_read_but_not_a_small_range_of_a_large_one() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    let mut content = String::new();
+    for i in 0..500 {
+        content.push_str(&format!("line number {i} has some real content in it\n"));
+    }
+    std::fs::write(r.join("big.txt"), content).unwrap();
+
+    // Whole file (~5900 tokens), budget 50 -> refuses.
+    vc(r)
+        .args(["read", "big.txt", "--budget", "50"])
+        .assert()
+        .failure()
+        .code(1);
+
+    // Two lines (~24 tokens) out of the same file, SAME budget -> succeeds.
+    let out = vc(r)
+        .args(["--json", "read", "big.txt:1-2", "--budget", "50"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["start"], 1);
+    assert_eq!(v["end"], 2);
 }
 
 /// Neither a path nor `--symbol` is a usage error, not a panic.

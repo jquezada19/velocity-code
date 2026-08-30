@@ -246,26 +246,149 @@ fn query_symbol_json_shape_carries_kind_signature_and_fuzzy() {
     );
 }
 
-/// `--symbol` + `--regex` together is a usage error (exit 2), routed
-/// through the same `VcError`/`--json` envelope as any other refusal —
-/// checked manually in `cmd_query` (not `clap`'s `conflicts_with`), same
-/// pattern as `doctor --rollback --discard`.
+/// The three search modes are mutually exclusive with each other, in
+/// every pairing — one loop over the pairs rather than one near-identical
+/// test per pair, which is how a fourth mode would arrive with two of its
+/// three pairings untested. Checked manually in `cmd_query` (not `clap`'s
+/// `conflicts_with`) so each refusal routes through the same
+/// `VcError`/`--json` envelope as any other, same pattern as `doctor
+/// --rollback --discard`.
 #[test]
-fn query_symbol_and_regex_together_is_usage_error() {
+fn query_mode_flags_are_mutually_exclusive_in_every_pairing() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
+
+    for pair in [
+        ["--symbol", "--regex"],
+        ["--ast", "--regex"],
+        ["--ast", "--symbol"],
+    ] {
+        let assert = vc(r)
+            .args(["query", "fetch_config($$$A)", pair[0], pair[1]])
+            .assert()
+            .failure()
+            .code(2);
+        let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+        assert!(
+            stderr.starts_with("usage:"),
+            "{pair:?}: expected a 'usage:' prefixed refusal, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("mutually exclusive"),
+            "{pair:?}: got: {stderr}"
+        );
+    }
+}
+
+/// An empty pattern matches at every byte position, so `vc query ""` built
+/// one hit per byte of the tree — materialized in full, because `--budget`
+/// only trims at render time. Both content modes refuse it up front, and
+/// the regex mode refuses every pattern that matches the empty string, not
+/// just the literally-empty one.
+#[test]
+fn empty_and_empty_matching_patterns_are_refused() {
     let d = tempfile::tempdir().unwrap();
     let r = d.path();
     std::fs::write(r.join("a.rs"), "fn alpha() {}\n").unwrap();
 
-    let assert = vc(r)
-        .args(["query", "alpha", "--symbol", "--regex"])
-        .assert()
-        .failure()
-        .code(2);
+    let assert = vc(r).args(["query", ""]).assert().failure().code(2);
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.starts_with("usage:"), "got: {stderr}");
+    assert!(stderr.contains("empty pattern"), "got: {stderr}");
+
+    for pattern in ["", "a*"] {
+        let assert = vc(r)
+            .args(["query", pattern, "--regex"])
+            .assert()
+            .failure()
+            .code(2);
+        let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+        assert!(
+            stderr.contains("empty string"),
+            "{pattern:?}: got: {stderr}"
+        );
+    }
+}
+
+/// A `--symbol` result that came only from the fuzzy substring tier is
+/// marked as such in the HUMAN header. `--json` has always carried the
+/// `fuzzy` flag; the human line said a plain "N hits" for a result
+/// containing no exact match at all.
+#[test]
+fn query_symbol_human_header_marks_a_fuzzy_only_result() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn load_configuration() {}\n").unwrap();
+
+    let out = vc(r)
+        .args(["query", "load_config", "--symbol"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    let header = text.lines().next().unwrap();
     assert!(
-        stderr.starts_with("usage:"),
-        "expected a 'usage:' prefixed refusal, got: {stderr}"
+        header.ends_with(" — 1 hits (fuzzy: no exact match)"),
+        "header must mark the fuzzy tier: {header}"
     );
+
+    // The control: an exact hit carries no marker.
+    std::fs::write(r.join("a.rs"), "fn load_config() {}\n").unwrap();
+    let out = vc(r)
+        .args(["query", "load_config", "--symbol"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    let header = text.lines().next().unwrap();
+    assert!(
+        header.ends_with(" — 1 hits"),
+        "an exact result must not be marked fuzzy: {header}"
+    );
+}
+
+/// A file the literal/regex search skipped is surfaced as a warning on
+/// stderr, not dropped in silence — the CLI half of the contract, joined
+/// into the same `CmdOutcome.warning` slot `--symbol` and `--ast` already
+/// use. Before this, the two content modes returned a short answer with
+/// nothing saying it was short, while the README claimed no file is ever
+/// skipped silently.
+///
+/// The oversized-file skip is what's exercised here: an *unreadable* file
+/// never reaches the search from the CLI, because `index::refresh` hashes
+/// every walked file first and fails the command outright — that path is
+/// covered at library level in `vc-query`'s own tests, where no index
+/// refresh intervenes.
+#[test]
+fn query_content_modes_warn_about_a_skipped_file() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("small.rs"), "fn alpha() {}\n").unwrap();
+    // Sparse, so it costs no real disk; the size gate reads `metadata`,
+    // never the body.
+    let big = std::fs::File::create(r.join("big.rs")).unwrap();
+    big.set_len(16 * 1024 * 1024 + 1).unwrap();
+    drop(big);
+
+    for mode in [vec!["query", "alpha"], vec!["query", "alpha", "--regex"]] {
+        let assert = vc(r).args(&mode).assert().success();
+        let out = assert.get_output();
+        let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+        let stderr = String::from_utf8(out.stderr.clone()).unwrap();
+        assert!(
+            stdout.contains("1 hits"),
+            "{mode:?}: the searchable file still answers: {stdout}"
+        );
+        assert!(
+            stderr.contains("warning:") && stderr.contains("big.rs"),
+            "{mode:?}: the skip must be surfaced: {stderr}"
+        );
+    }
 }
 
 /// A malformed file in scope is skipped, not fatal — the command still

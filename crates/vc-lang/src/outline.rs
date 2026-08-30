@@ -38,9 +38,15 @@ fn tokens_est(bytes: usize) -> usize {
 /// top-level alike has been dropped).
 pub fn outline(src: &str, lang: &str, budget: Option<usize>) -> VcResult<(String, usize)> {
     if !OUTLINE_LANGS.contains(&lang) {
+        // The remedy belongs in `next:` per the error grammar (`kind:
+        // message — next: <cmd>`), but the useful form of it names the
+        // actual file (`vc read notes.txt`), and `outline` is handed only
+        // source text — it has never seen a path. So the message states
+        // the fact and the CLI, which does know the path, attaches the
+        // hint. A remedy the caller cannot copy and run is not a remedy.
         return Err(VcError::new(
             ErrorKind::Usage,
-            "outline: unsupported language — vc read the file instead",
+            "outline: unsupported language",
         ));
     }
 
@@ -237,13 +243,17 @@ mod tests {
         );
     }
 
+    /// The refusal states the fact only; the `next:` remedy is attached by
+    /// the CLI, which is the layer that knows the file's path. `outline`
+    /// itself must not invent a remedy it cannot make specific.
     #[test]
-    fn unsupported_language_is_a_usage_refusal_pointing_at_read() {
+    fn unsupported_language_is_a_usage_refusal_without_a_pathless_remedy() {
         let err = outline("x = 1", "python", None).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Usage);
-        assert_eq!(
-            err.message,
-            "outline: unsupported language — vc read the file instead"
+        assert_eq!(err.message, "outline: unsupported language");
+        assert!(
+            err.next.is_none(),
+            "the remedy is the CLI's to attach, with the real path in it"
         );
     }
 }

@@ -933,22 +933,33 @@ fn cmd_query(
         return cmd_query_ast(root, pattern, lang, budget, &scope, epoch8);
     }
 
-    let hits = if regex {
+    let (hits, warnings) = if regex {
         velocity_code_query::search_regex(root, pattern, &scope)?
     } else {
         velocity_code_query::search_literal(root, pattern, &scope)?
     };
-    let n = hits.len();
-    let budgeted = velocity_code_query::render_hits(&hits, budget);
+    Ok(query_hits_outcome(root, &hits, budget, epoch8, warnings))
+}
 
-    let mut human = format!("epoch {epoch8} — {n} hits\n");
-    if !budgeted.text.is_empty() {
-        human.push_str(&budgeted.text);
-        human.push('\n');
-    }
-    if budgeted.elided > 0 {
-        human.push_str(&format!("… elided {} hits (budget)\n", budgeted.elided));
-    }
+/// The shared tail of every `Vec<QueryHit>` search mode — literal, regex
+/// (`cmd_query`) and structural (`cmd_query_ast`): epoch header, budgeted
+/// render, the elided line, the `--json` envelope, read-gain accounting,
+/// and the joined warning line. All three modes differ only in how they
+/// PRODUCE hits; from the hits onward they were three verbatim copies of
+/// this, which is three places for one contract to drift.
+///
+/// `header_suffix` is the one point of variation the callers actually
+/// need (`query --symbol` marks a fuzzy result there); it is appended to
+/// the `— N hits` header.
+fn query_hits_outcome(
+    root: &Path,
+    hits: &[velocity_code_query::QueryHit],
+    budget: Option<usize>,
+    epoch8: String,
+    warnings: Vec<String>,
+) -> CmdOutcome {
+    let budgeted = velocity_code_query::render_hits(hits, budget);
+    let (human, included) = render_hits_human(&epoch8, "", hits.len(), &budgeted);
 
     // `render_hits` walks `hits` front-to-back, greedily including whole
     // hits until the running token estimate would exceed `budget`, so the
@@ -957,7 +968,6 @@ fn cmd_query(
     // `--json` `hits` array consistent with `elided` (their counts must
     // sum to the total match count) instead of dumping every match
     // regardless of budget.
-    let included = n - budgeted.elided;
     let json_hits: Vec<serde_json::Value> = hits[..included]
         .iter()
         .map(|h| {
@@ -981,16 +991,50 @@ fn cmd_query(
     let bytes_out = human.len() as u64;
     let naive_bytes = naive_bytes_for_files(root, unique_files);
 
-    Ok(CmdOutcome {
+    CmdOutcome {
         human,
         json,
         files,
-        edits: n,
+        edits: hits.len(),
         epoch8,
-        warning: None,
+        warning: join_warnings(warnings),
         bytes_out: Some(bytes_out),
         naive_bytes: Some(naive_bytes),
-    })
+    }
+}
+
+/// The `epoch {e} — {n} hits{suffix}` header plus the budgeted body and
+/// the `… elided N hits (budget)` line, shared by every query mode.
+/// Returns the rendered text and the number of hits it actually included
+/// (total minus elided) so the caller can slice `--json` to match.
+fn render_hits_human(
+    epoch8: &str,
+    header_suffix: &str,
+    total: usize,
+    budgeted: &velocity_code_query::Budgeted,
+) -> (String, usize) {
+    let mut human = format!("epoch {epoch8} — {total} hits{header_suffix}\n");
+    if !budgeted.text.is_empty() {
+        human.push_str(&budgeted.text);
+        human.push('\n');
+    }
+    if budgeted.elided > 0 {
+        human.push_str(&format!("… elided {} hits (budget)\n", budgeted.elided));
+    }
+    (human, total - budgeted.elided)
+}
+
+/// Multiple per-file warnings collapse into `CmdOutcome`'s single
+/// `warning` slot (the same one apply/undo use for a non-fatal,
+/// surfaced-but-not-failing condition) — joined rather than dropped, so
+/// every skipped file is still visible to the caller. `None` when there is
+/// nothing to say, so no empty `warning:` line is printed.
+fn join_warnings(warnings: Vec<String>) -> Option<String> {
+    if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join("; "))
+    }
 }
 
 /// `vc query NAME --symbol` handler, split out of [`cmd_query`] because its
@@ -1011,20 +1055,24 @@ fn cmd_query_symbol(
     let n = hits.len();
     let budgeted = velocity_code_query::render_symbol_hits(&hits, budget);
 
-    let mut human = format!("epoch {epoch8} — {n} hits\n");
-    if !budgeted.text.is_empty() {
-        human.push_str(&budgeted.text);
-        human.push('\n');
-    }
-    if budgeted.elided > 0 {
-        human.push_str(&format!("… elided {} hits (budget)\n", budgeted.elided));
-    }
-
+    // `--json` has carried a top-level `fuzzy` flag since this mode
+    // shipped; the human header did not, so a human reader saw a plain
+    // "N hits" for a result that contains no exact match at all — every
+    // hit merely a substring neighbour of what they asked for. Mark it.
+    // (Marked only when there is something to mark: a zero-hit search is
+    // reported as fuzzy by `search_symbol`'s tiering, but "0 hits (fuzzy:
+    // no exact match)" would put the label on every empty result.)
+    let header_suffix = if fuzzy && n > 0 {
+        " (fuzzy: no exact match)"
+    } else {
+        ""
+    };
     // Same "included = total - elided, slice the front" reasoning as
     // cmd_query's literal/regex path: render_symbol_hits walks hits
     // front-to-back and greedily includes whole hits, so the rendered
     // text is exactly the first `n - budgeted.elided` of them.
-    let included = n - budgeted.elided;
+    let (human, included) = render_hits_human(&epoch8, header_suffix, n, &budgeted);
+
     let json_hits: Vec<serde_json::Value> = hits[..included]
         .iter()
         .map(|h| {
@@ -1058,15 +1106,6 @@ fn cmd_query_symbol(
     let files = unique_files.len();
     let bytes_out = human.len() as u64;
     let naive_bytes = naive_bytes_for_files(root, unique_files);
-    // Multiple per-file parse warnings collapse into CmdOutcome's single
-    // `warning` slot (the same one apply/undo use for a non-fatal,
-    // surfaced-but-not-failing condition) — joined rather than dropped, so
-    // every skipped file is still visible to the caller.
-    let warning = if warnings.is_empty() {
-        None
-    } else {
-        Some(warnings.join("; "))
-    };
 
     Ok(CmdOutcome {
         human,
@@ -1074,7 +1113,7 @@ fn cmd_query_symbol(
         files,
         edits: n,
         epoch8,
-        warning,
+        warning: join_warnings(warnings),
         bytes_out: Some(bytes_out),
         naive_bytes: Some(naive_bytes),
     })
@@ -1086,10 +1125,12 @@ fn cmd_query_symbol(
 /// genuinely diverge from the literal/regex path. `lang` resolution goes
 /// through [`infer_scope_lang`] — the exact function `plan_match_pipeline`
 /// uses — so `--ast`'s auto-detect and refusal messages match `plan
-/// match`'s precisely rather than a second, drifting copy. Rendering,
-/// budgeting, `--json` shape, and read-gain accounting are otherwise
-/// identical to `cmd_query`'s literal/regex path — both work over
-/// `Vec<QueryHit>`.
+/// match`'s precisely rather than a second, drifting copy. From the hits
+/// onward it shares [`query_hits_outcome`] with the literal/regex path —
+/// same rendering, budgeting, `--json` shape, read-gain accounting, and
+/// warning surfacing, because both work over `Vec<QueryHit>` and a file
+/// `match_sites` had to skip must not fail a query that still found real
+/// sites.
 fn cmd_query_ast(
     root: &Path,
     pattern: &str,
@@ -1100,62 +1141,7 @@ fn cmd_query_ast(
 ) -> VcResult<CmdOutcome> {
     let (lang, scope_files) = infer_scope_lang(root, scope, lang)?;
     let (hits, warnings) = velocity_code_query::search_ast(root, pattern, &lang, &scope_files)?;
-    let n = hits.len();
-    let budgeted = velocity_code_query::render_hits(&hits, budget);
-
-    let mut human = format!("epoch {epoch8} — {n} hits\n");
-    if !budgeted.text.is_empty() {
-        human.push_str(&budgeted.text);
-        human.push('\n');
-    }
-    if budgeted.elided > 0 {
-        human.push_str(&format!("… elided {} hits (budget)\n", budgeted.elided));
-    }
-
-    // Same "included = total - elided, slice the front" reasoning as
-    // cmd_query's literal/regex path.
-    let included = n - budgeted.elided;
-    let json_hits: Vec<serde_json::Value> = hits[..included]
-        .iter()
-        .map(|h| {
-            serde_json::json!({
-                "path": h.path.to_string_lossy(),
-                "line": h.line,
-                "col": h.col,
-                "text": h.line_text,
-            })
-        })
-        .collect();
-    let json = serde_json::json!({
-        "epoch8": epoch8,
-        "hits": json_hits,
-        "elided": budgeted.elided,
-    });
-
-    let unique_files: std::collections::BTreeSet<&std::path::PathBuf> =
-        hits.iter().map(|h| &h.path).collect();
-    let files = unique_files.len();
-    let bytes_out = human.len() as u64;
-    let naive_bytes = naive_bytes_for_files(root, unique_files);
-    // Same non-fatal-warning posture as `cmd_query_symbol`/`plan match`:
-    // a file `match_sites` had to skip (non-UTF8, or an error-containing
-    // parse tree) must not fail a query that still found real sites.
-    let warning = if warnings.is_empty() {
-        None
-    } else {
-        Some(warnings.join("; "))
-    };
-
-    Ok(CmdOutcome {
-        human,
-        json,
-        files,
-        edits: n,
-        epoch8,
-        warning,
-        bytes_out: Some(bytes_out),
-        naive_bytes: Some(naive_bytes),
-    })
+    Ok(query_hits_outcome(root, &hits, budget, epoch8, warnings))
 }
 
 /// `vc outline <path> [--budget N]` — read-only skeleton render, never
@@ -1178,9 +1164,21 @@ fn cmd_outline(
     let (_ix, epoch) = index::refresh(root)?;
     let epoch8 = index::epoch8(&epoch).to_string();
 
-    let src = std::fs::read_to_string(root.join(&rel))?;
+    let path_disp = rel.display().to_string();
+    let src = std::fs::read_to_string(root.join(&rel))
+        .map_err(|e| VcError::new(ErrorKind::Io, format!("{path_disp}: {e}")))?;
     let lang = lang_tag(&rel);
-    let (skeleton, elided) = velocity_code_lang::outline::outline(&src, lang, budget)?;
+    // `outline` knows the language is unsupported but not which file was
+    // asked for, so it states the fact and leaves `next:` empty; this is
+    // the layer that can name the path in a command the caller can run.
+    let (skeleton, elided) =
+        velocity_code_lang::outline::outline(&src, lang, budget).map_err(|e| {
+            if e.next.is_none() {
+                e.with_next(format!("vc read {path_disp}"))
+            } else {
+                e
+            }
+        })?;
 
     let mut human = format!("epoch {epoch8} — {elided} elided\n");
     if !skeleton.is_empty() {
@@ -1256,8 +1254,16 @@ fn parse_range_suffix(s: &str) -> (&str, Option<(usize, usize)>) {
 /// before ever touching the file. `b` beyond EOF clamps to the file's true
 /// last line rather than refusing — agents overshoot ranges constantly, and
 /// a clamp (with the true end reported back) is more useful than a
-/// refusal. No range at all reads the whole file. Over budget (when set)
-/// refuses via [`cmd_read_budget_check`] instead of silently truncating.
+/// refusal.
+///
+/// A start line beyond EOF is the other half, and is NOT clamped: `a >
+/// total` names no content at all, so it refuses `NotFound` naming the
+/// file's true length, with a `next:` hint for the whole file. Returning
+/// an inverted `start > end` "success" with empty text would hide from the
+/// caller that they read nothing.
+///
+/// No range at all reads the whole file. Over budget (when set) refuses
+/// via [`cmd_read_budget_check`] instead of silently truncating.
 fn cmd_read_path(
     root: &Path,
     cwd: &Path,
@@ -1278,18 +1284,33 @@ fn cmd_read_path(
     let (_ix, epoch) = index::refresh(root)?;
     let epoch8 = index::epoch8(&epoch).to_string();
 
-    let content = std::fs::read_to_string(root.join(&rel))?;
+    let path_disp = rel.display().to_string();
+    let abs = root.join(&rel);
+
+    // Whole-file read with a budget: settle it from the file's SIZE before
+    // reading a byte. A budget refusal on the whole file is decided by
+    // `tokens_est` over the rendered text, and the rendered text is the
+    // content plus a `{line}: ` prefix per line — never shorter than the
+    // raw bytes. So a file whose raw length already blows the budget can
+    // only refuse, and reading it in full first (a `--budget 200` read of
+    // a 2 GiB file materialized all 2 GiB, then refused) buys nothing.
+    //
+    // Deliberately not applied to a RANGE read: a small range out of a
+    // large file is a legitimate, useful request, and gating it on the
+    // whole file's size would turn working reads into refusals. The
+    // post-render check below still covers that case exactly as before.
+    if range.is_none()
+        && let Some(budget) = budget
+        && let Ok(md) = std::fs::metadata(&abs)
+    {
+        cmd_read_budget_check(&path_disp, md.len() as usize, Some(budget))?;
+    }
+
+    let content = std::fs::read_to_string(&abs)
+        .map_err(|e| VcError::new(ErrorKind::Io, format!("{path_disp}: {e}")))?;
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
-    let path_disp = rel.display().to_string();
     let (start, end) = match range {
-        // A start beyond EOF is unsatisfiable, not clampable — unlike `b`
-        // (agents overshoot the *end* of a range constantly, and clamping
-        // it to the true end is strictly more useful than refusing), a
-        // request that starts past the last line names no content at all.
-        // Silently returning an inverted start>end "success" with empty
-        // text would hide that from the caller; refuse instead (controller
-        // ruling, fix round 1).
         Some((a, b)) if a > total => {
             return Err(VcError::new(
                 ErrorKind::NotFound,
@@ -1301,60 +1322,58 @@ fn cmd_read_path(
         None => (1, total),
     };
 
-    let mut text = String::new();
-    for i in start..=end {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&format!("{i}: {}", lines[i - 1]));
-    }
-
-    cmd_read_budget_check(&path_disp, &text, budget)?;
-
-    let mut human = format!("epoch {epoch8} — {path_disp}:{start}-{end}\n");
-    if !text.is_empty() {
-        human.push_str(&text);
-        human.push('\n');
-    }
-    let json = serde_json::json!({
-        "epoch8": epoch8,
-        "path": path_disp,
-        "start": start,
-        "end": end,
-        "text": text,
-    });
-
-    let bytes_out = human.len() as u64;
-    let naive_bytes = content.len() as u64;
-
-    Ok(CmdOutcome {
-        human,
-        json,
-        files: 1,
-        edits: 0,
-        epoch8,
-        warning: None,
-        bytes_out: Some(bytes_out),
-        naive_bytes: Some(naive_bytes),
-    })
+    read_outcome(
+        &path_disp, &lines, start, end, &content, epoch8, budget, None,
+    )
 }
 
-/// `--symbol NAME` `read` mode: unique match -> its full body, line-
+/// `--symbol NAME` `read` mode: unique EXACT match -> its full body, line-
 /// prefixed the same way `cmd_read_path` renders a range. Zero matches ->
 /// `NotFound`; more than one -> `Ambiguous`, listing every candidate as
 /// `path:line` in the message so the caller can retry with an explicit
 /// range on the one they meant.
+///
+/// A FUZZY-only result refuses. `search_symbol` falls back to a
+/// case-insensitive substring tier when no symbol's name equals the query,
+/// and `read` used to discard that flag entirely — so `vc read --symbol
+/// load_config`, with no `load_config` anywhere in the tree, printed
+/// `load_configuration_from_disk`'s body at exit 0 with nothing in the
+/// output marking it as a different function. Serving the wrong body,
+/// unlabelled, to a caller who asked for a specific one is the failure
+/// this whole tool exists to refuse. The candidates are listed (`path:line
+/// name`) so the near-misses are still useful, and the `next:` hint points
+/// at `vc query --symbol`, which is the verb that may legitimately answer
+/// fuzzily.
 fn cmd_read_symbol(root: &Path, name: &str, budget: Option<usize>) -> VcResult<CmdOutcome> {
     let (_ix, epoch) = index::refresh(root)?;
     let epoch8 = index::epoch8(&epoch).to_string();
 
-    let (hits, _fuzzy, warnings) = velocity_code_query::search_symbol(root, name, &[])?;
+    let (hits, fuzzy, warnings) = velocity_code_query::search_symbol(root, name, &[])?;
     let hit = match hits.len() {
         0 => {
             return Err(
                 VcError::new(ErrorKind::NotFound, format!("{name}: no symbol found"))
                     .with_next(format!("vc query {name} --symbol")),
             );
+        }
+        _ if fuzzy => {
+            let candidates = hits
+                .iter()
+                .map(|h| {
+                    format!(
+                        "{}:{} {}",
+                        h.path.display(),
+                        h.symbol.start_line,
+                        h.symbol.name
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(VcError::new(
+                ErrorKind::NotFound,
+                format!("{name}: no symbol by that name; did you mean: {candidates}"),
+            )
+            .with_next(format!("vc query {name} --symbol")));
         }
         1 => &hits[0],
         n => {
@@ -1370,11 +1389,44 @@ fn cmd_read_symbol(root: &Path, name: &str, budget: Option<usize>) -> VcResult<C
         }
     };
 
-    let content = std::fs::read_to_string(root.join(&hit.path))?;
+    let path_disp = hit.path.display().to_string();
+    let content = std::fs::read_to_string(root.join(&hit.path))
+        .map_err(|e| VcError::new(ErrorKind::Io, format!("{path_disp}: {e}")))?;
     let lines: Vec<&str> = content.lines().collect();
     let start = hit.symbol.start_line;
     let end = hit.symbol.end_line.min(lines.len());
 
+    // Same non-fatal-warning posture as `cmd_query_symbol`: a malformed
+    // file elsewhere in the search must not fail a read that found its
+    // target fine.
+    read_outcome(
+        &path_disp,
+        &lines,
+        start,
+        end,
+        &content,
+        epoch8,
+        budget,
+        join_warnings(warnings),
+    )
+}
+
+/// The shared tail of both `read` modes: render lines `start..=end` with
+/// their `{line}: ` prefixes, apply the budget refusal, then build the
+/// identical human text, `--json` shape (`{epoch8, path, start, end,
+/// text}`) and read-gain accounting. The two modes differ only in how they
+/// arrive at a path and a line range.
+#[allow(clippy::too_many_arguments)]
+fn read_outcome(
+    path_disp: &str,
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    content: &str,
+    epoch8: String,
+    budget: Option<usize>,
+    warning: Option<String>,
+) -> VcResult<CmdOutcome> {
     let mut text = String::new();
     for i in start..=end {
         if !text.is_empty() {
@@ -1383,8 +1435,7 @@ fn cmd_read_symbol(root: &Path, name: &str, budget: Option<usize>) -> VcResult<C
         text.push_str(&format!("{i}: {}", lines[i - 1]));
     }
 
-    let path_disp = hit.path.display().to_string();
-    cmd_read_budget_check(&path_disp, &text, budget)?;
+    cmd_read_budget_check(path_disp, text.len(), budget)?;
 
     let mut human = format!("epoch {epoch8} — {path_disp}:{start}-{end}\n");
     if !text.is_empty() {
@@ -1398,15 +1449,6 @@ fn cmd_read_symbol(root: &Path, name: &str, budget: Option<usize>) -> VcResult<C
         "end": end,
         "text": text,
     });
-
-    // Same non-fatal-warning posture as `cmd_query_symbol`: a malformed
-    // file elsewhere in the search must not fail a read that found its
-    // target fine.
-    let warning = if warnings.is_empty() {
-        None
-    } else {
-        Some(warnings.join("; "))
-    };
 
     let bytes_out = human.len() as u64;
     let naive_bytes = content.len() as u64;
@@ -1424,16 +1466,21 @@ fn cmd_read_symbol(root: &Path, name: &str, budget: Option<usize>) -> VcResult<C
 }
 
 /// Shared over-budget refusal for both `read` modes: `budget: None` always
-/// passes. Otherwise, refuses with the new `ErrorKind::Budget` (controller
-/// ruling 2026-08-29 — a budget refusal is a fact about the requested
-/// content, not a malformed invocation, so it is deliberately not `Usage`)
-/// the moment the rendered text's `tokens_est` would exceed it, before any
-/// of that text reaches the caller — `read` never silently truncates.
-fn cmd_read_budget_check(path_disp: &str, text: &str, budget: Option<usize>) -> VcResult<()> {
+/// passes. Otherwise, refuses with `ErrorKind::Budget` — a budget refusal
+/// is a fact about the requested *content*, not a malformed invocation, so
+/// it is deliberately not `Usage` — the moment `bytes`' `tokens_est` would
+/// exceed it, before any of that content reaches the caller. `read` never
+/// silently truncates.
+///
+/// Takes a byte COUNT rather than the text itself so a whole-file read can
+/// settle the question from `metadata` without materializing the file: the
+/// rendered text is never shorter than the raw content it wraps, so a raw
+/// length already over budget can only refuse.
+fn cmd_read_budget_check(path_disp: &str, bytes: usize, budget: Option<usize>) -> VcResult<()> {
     let Some(budget) = budget else {
         return Ok(());
     };
-    let tokens = velocity_code_query::tokens_est(text.len());
+    let tokens = velocity_code_query::tokens_est(bytes);
     if tokens > budget {
         return Err(VcError::new(
             ErrorKind::Budget,

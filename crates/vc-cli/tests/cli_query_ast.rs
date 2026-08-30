@@ -70,45 +70,10 @@ fn ast_mode_finds_every_call_site() {
     );
 }
 
-/// `--ast` + `--regex` together is a usage error (exit 2) — routed
-/// through the normal `VcError`/`--json` envelope, same pattern as
-/// `--symbol` + `--regex` (cli_query.rs).
-#[test]
-fn ast_and_regex_together_is_usage_error() {
-    let d = tempfile::tempdir().unwrap();
-    let r = d.path();
-    std::fs::write(r.join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
-
-    let assert = vc(r)
-        .args(["query", "fetch_config($$$A)", "--ast", "--regex"])
-        .assert()
-        .failure()
-        .code(2);
-    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
-    assert!(
-        stderr.starts_with("usage:"),
-        "expected a 'usage:' prefixed refusal, got: {stderr}"
-    );
-}
-
-/// `--ast` + `--symbol` together is a usage error (exit 2).
-#[test]
-fn ast_and_symbol_together_is_usage_error() {
-    let d = tempfile::tempdir().unwrap();
-    let r = d.path();
-    std::fs::write(r.join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
-
-    let assert = vc(r)
-        .args(["query", "fetch_config($$$A)", "--ast", "--symbol"])
-        .assert()
-        .failure()
-        .code(2);
-    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
-    assert!(
-        stderr.starts_with("usage:"),
-        "expected a 'usage:' prefixed refusal, got: {stderr}"
-    );
-}
+// `--ast` against `--regex`/`--symbol` is covered with every other mode
+// pairing by `query_mode_flags_are_mutually_exclusive_in_every_pairing`
+// (cli_query.rs) — one loop over the pairs, rather than a near-identical
+// test per pair here.
 
 /// Zero matches under `--ast` is still success (exit 0), same "found
 /// nothing" vs "the command failed" contract every other query mode has.

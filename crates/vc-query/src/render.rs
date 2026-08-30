@@ -87,11 +87,58 @@ fn render_symbol_hit_line(hit: &SymbolHit) -> String {
 }
 
 /// Lowercase label for a [`SymbolKind`], used in both the human hit line
-/// (`[method]`) and the `--json` `kind` field. A straight
-/// `Debug`-then-lowercase of the enum name (`Function` -> `function`,
-/// `TypeAlias` -> `typealias`) — deterministic and exhaustive-by-construction
-/// (a new `SymbolKind` variant picks up a label for free, no match arm to
-/// forget), at the cost of no separator in the multi-word variant.
+/// (`[method]`) and the `--json` `kind` field.
+///
+/// An explicit match, not `format!("{kind:?}").to_lowercase()`. The
+/// `Debug` derivation gave every variant a label for free, but it made
+/// the CLI's public `kind` strings a silent function of internal type
+/// names: renaming a variant, or adding one whose lowercased name is not
+/// the label we want, would change or invent output with nothing to catch
+/// it. Exhaustively matching turns both into compile errors at the exact
+/// place the label is decided.
+///
+/// `TypeAlias` -> `"typealias"` is kept verbatim from the derived
+/// behaviour — the labels are already a published contract, and this
+/// change is about how they are produced, not what they are.
 pub fn symbol_kind_label(kind: &SymbolKind) -> String {
-    format!("{kind:?}").to_lowercase()
+    match kind {
+        SymbolKind::Function => "function",
+        SymbolKind::Method => "method",
+        SymbolKind::Struct => "struct",
+        SymbolKind::Enum => "enum",
+        SymbolKind::Trait => "trait",
+        SymbolKind::Impl => "impl",
+        SymbolKind::Const => "const",
+        SymbolKind::Static => "static",
+        SymbolKind::Module => "module",
+        SymbolKind::TypeAlias => "typealias",
+    }
+    .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every label, pinned as the published `--json` `kind` contract — and
+    /// as proof the hand-written match reproduces exactly what the
+    /// `Debug`-derived version produced, `typealias` (no separator)
+    /// included.
+    #[test]
+    fn symbol_kind_labels_are_stable_lowercase_names() {
+        for (kind, label) in [
+            (SymbolKind::Function, "function"),
+            (SymbolKind::Method, "method"),
+            (SymbolKind::Struct, "struct"),
+            (SymbolKind::Enum, "enum"),
+            (SymbolKind::Trait, "trait"),
+            (SymbolKind::Impl, "impl"),
+            (SymbolKind::Const, "const"),
+            (SymbolKind::Static, "static"),
+            (SymbolKind::Module, "module"),
+            (SymbolKind::TypeAlias, "typealias"),
+        ] {
+            assert_eq!(symbol_kind_label(&kind), label, "for {kind:?}");
+        }
+    }
 }
