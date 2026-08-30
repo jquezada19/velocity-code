@@ -1314,6 +1314,24 @@ fn cmd_read_path(
     let path_disp = rel.display().to_string();
     let abs = root.join(&rel);
 
+    // Open ONCE, and take the size from that handle. The budget pre-check
+    // and the read that follows then describe the same open file, rather
+    // than two independent lookups of a path that could name a different
+    // inode by the second one — a `--budget 200` pre-check that cleared a
+    // small file, followed by a read of a large replacement, would have
+    // been the failure this shape removes.
+    //
+    // Residual, stated precisely: the check still describes the file as it
+    // was when `metadata` was called on the handle. The SAME file can grow
+    // between that call and the `read_to_string` below, so a whole-file
+    // read can still return more than the pre-check reasoned about. That
+    // growth is out of scope here and is not a correctness hole: the
+    // post-render `cmd_read_budget_check` in `read_outcome` runs on the
+    // actually-rendered text and still refuses. What the open-once shape
+    // rules out is the different-inode case, which no later check catches.
+    let mut file = std::fs::File::open(&abs)
+        .map_err(|e| VcError::new(ErrorKind::Io, format!("{path_disp}: {e}")))?;
+
     // Whole-file read with a budget: settle it from the file's SIZE before
     // reading a byte. A budget refusal on the whole file is decided by
     // `tokens_est` over the rendered text, and the rendered text is the
@@ -1328,12 +1346,13 @@ fn cmd_read_path(
     // post-render check below still covers that case exactly as before.
     if range.is_none()
         && let Some(budget) = budget
-        && let Ok(md) = std::fs::metadata(&abs)
+        && let Ok(md) = file.metadata()
     {
         cmd_read_budget_check(&path_disp, md.len() as usize, Some(budget))?;
     }
 
-    let content = std::fs::read_to_string(&abs)
+    let mut content = String::new();
+    file.read_to_string(&mut content)
         .map_err(|e| VcError::new(ErrorKind::Io, format!("{path_disp}: {e}")))?;
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();

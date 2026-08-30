@@ -117,13 +117,31 @@ fn refuse_if_over_hit_cap(n: usize) -> VcResult<()> {
 /// search here, exactly as it is for ripgrep, and warning per binary file
 /// would bury the real diagnostics.
 ///
-/// Order matters. `metadata` gates the size before a single byte is read;
+/// Order matters. The size gate runs before any content byte is read;
 /// then only the first [`BINARY_SNIFF_LEN`] bytes are read, and a binary
 /// file returns without ever pulling in the rest. Previously the whole
 /// file was read first and *then* sniffed, so a 40 MiB binary cost a full
 /// 40 MiB read to reach a decision that the first 8 KiB already settled.
+///
+/// **Open once, then bound.** The file is opened first and its size read
+/// from that same handle, so the size gate and the content read describe
+/// one file rather than two lookups of a path that could have been
+/// replaced in between. The size gate is still only an *opinion about the
+/// past* — a file can grow after it is stat'd — so the read itself is
+/// bounded too: `take(MAX_SEARCH_FILE_BYTES + 1)` over the whole read, and
+/// if that extra probe byte materializes the file is treated as over the
+/// cap (skipped, with a warning) rather than processed. The returned
+/// buffer therefore can never exceed the cap, whatever the file does
+/// while it is being read.
 fn read_for_search(full: &Path, rel: &Path, warnings: &mut Vec<String>) -> Option<Vec<u8>> {
-    let md = match fs::metadata(full) {
+    let mut file = match fs::File::open(full) {
+        Ok(f) => f,
+        Err(e) => {
+            warnings.push(format!("{}: skipped — {e}", rel.display()));
+            return None;
+        }
+    };
+    let md = match file.metadata() {
         Ok(md) => md,
         Err(e) => {
             warnings.push(format!("{}: skipped — {e}", rel.display()));
@@ -139,13 +157,6 @@ fn read_for_search(full: &Path, rel: &Path, warnings: &mut Vec<String>) -> Optio
         return None;
     }
 
-    let mut file = match fs::File::open(full) {
-        Ok(f) => f,
-        Err(e) => {
-            warnings.push(format!("{}: skipped — {e}", rel.display()));
-            return None;
-        }
-    };
     let mut bytes = Vec::with_capacity(len.min(BINARY_SNIFF_LEN as u64) as usize);
     if let Err(e) = (&mut file)
         .take(BINARY_SNIFF_LEN as u64)
@@ -158,9 +169,23 @@ fn read_for_search(full: &Path, rel: &Path, warnings: &mut Vec<String>) -> Optio
         return None;
     }
     // `take` consumed at most the sniff window; the handle is positioned
-    // right after it, so this reads the remainder without re-reading.
-    if let Err(e) = file.read_to_end(&mut bytes) {
+    // right after it, so this reads the remainder without re-reading. The
+    // remainder is bounded so that the TOTAL is at most the cap plus one
+    // probe byte — `bytes.len()` here is at most BINARY_SNIFF_LEN, well
+    // under the cap, so the subtraction cannot underflow.
+    let remaining = MAX_SEARCH_FILE_BYTES + 1 - bytes.len() as u64;
+    if let Err(e) = (&mut file).take(remaining).read_to_end(&mut bytes) {
         warnings.push(format!("{}: skipped — {e}", rel.display()));
+        return None;
+    }
+    if bytes.len() as u64 > MAX_SEARCH_FILE_BYTES {
+        // The probe byte arrived: the file grew past the cap between the
+        // stat above and this read. Same policy as a file that was
+        // already too big — skip it, and say so.
+        warnings.push(format!(
+            "{}: skipped — grew past the {MAX_SEARCH_FILE_BYTES}-byte search limit while being read",
+            rel.display()
+        ));
         return None;
     }
     Some(bytes)
@@ -831,6 +856,34 @@ mod tests {
         // The control: a pattern that cannot match empty still works.
         let (hits, _) = search_regex(d.path(), "a+", &[]).unwrap();
         assert!(!hits.is_empty());
+    }
+
+    /// The bound `read_for_search` promises: whatever it returns is at
+    /// most [`MAX_SEARCH_FILE_BYTES`], and a file already past the cap is
+    /// skipped outright rather than returned truncated (a truncated buffer
+    /// would silently answer a search with part of a file).
+    #[test]
+    fn read_for_search_never_returns_more_than_the_cap() {
+        let d = tempfile::tempdir().unwrap();
+
+        let small = d.path().join("a.rs");
+        std::fs::write(&small, "fn alpha() {}\n").unwrap();
+        let mut warnings = Vec::new();
+        let bytes = read_for_search(&small, Path::new("a.rs"), &mut warnings).unwrap();
+        assert!(bytes.len() as u64 <= MAX_SEARCH_FILE_BYTES);
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+
+        // Sparse (`set_len`), so this costs no real disk.
+        let big = d.path().join("big.rs");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(MAX_SEARCH_FILE_BYTES + 1).unwrap();
+        drop(f);
+        let mut warnings = Vec::new();
+        assert!(
+            read_for_search(&big, Path::new("big.rs"), &mut warnings).is_none(),
+            "an over-cap file is skipped, never truncated into an answer"
+        );
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
     }
 
     /// A file past the size cap is skipped, and the skip is REPORTED. The
