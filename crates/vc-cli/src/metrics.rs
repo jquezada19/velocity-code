@@ -47,32 +47,50 @@ struct MetricLine<'a> {
     refusal: Option<&'a str>,
     epoch8: &'a str,
     version: &'a str,
+    /// Read-side gain accounting (Task 15, spec §7.2), populated only for
+    /// the read verbs (`query`/`outline`/`read`) — every other verb
+    /// passes `None`, and `skip_serializing_if` omits the key entirely so
+    /// an old-format reader (or a human skimming the JSONL) never sees a
+    /// meaningless `null`/`0` on a write/status/plan line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_out: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    naive_bytes: Option<u64>,
+}
+
+/// One invocation's worth of metrics, as a named struct rather than a
+/// nine-argument positional list.
+///
+/// Every field but `verb` is a scalar, and four of them are numbers of
+/// the same two types — so a transposed pair (`files`/`edits`,
+/// `bytes_out`/`naive_bytes`) type-checks perfectly and silently corrupts
+/// the metric it lands in. Naming them at the call site is what makes
+/// that a visible mistake instead of an invisible one, and it retires the
+/// three `#[allow(clippy::too_many_arguments)]` suppressions that were
+/// standing in for this.
+pub struct MetricEvent<'a> {
+    pub verb: &'a str,
+    pub ms: u64,
+    pub files: usize,
+    pub edits: usize,
+    pub refusal: Option<&'a str>,
+    pub epoch8: &'a str,
+    /// Read-side gain accounting (Task 15) — `Some` only for the read
+    /// verbs (`query`/`outline`/`read`), from `CmdOutcome::bytes_out`.
+    pub bytes_out: Option<u64>,
+    /// The counterfactual half of the same accounting, from
+    /// `CmdOutcome::naive_bytes`. `Some` only alongside `bytes_out`.
+    pub naive_bytes: Option<u64>,
 }
 
 /// Append one metrics line for this invocation. Never fails outward: any
 /// I/O error (unwritable `.vc/`, full disk, ...) is silently dropped —
 /// see the module doc comment.
-pub fn record(
-    root: &Path,
-    verb: &str,
-    ms: u64,
-    files: usize,
-    edits: usize,
-    refusal: Option<&str>,
-    epoch8: &str,
-) {
-    let _ = try_record(root, verb, ms, files, edits, refusal, epoch8);
+pub fn record(root: &Path, event: &MetricEvent<'_>) {
+    let _ = try_record(root, event);
 }
 
-fn try_record(
-    root: &Path,
-    verb: &str,
-    ms: u64,
-    files: usize,
-    edits: usize,
-    refusal: Option<&str>,
-    epoch8: &str,
-) -> std::io::Result<()> {
+fn try_record(root: &Path, event: &MetricEvent<'_>) -> std::io::Result<()> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -82,13 +100,15 @@ fn try_record(
     let path = dir.join(format!("{}.jsonl", date_string(ts)));
     let line = MetricLine {
         ts,
-        verb,
-        ms,
-        files,
-        edits,
-        refusal,
-        epoch8,
+        verb: event.verb,
+        ms: event.ms,
+        files: event.files,
+        edits: event.edits,
+        refusal: event.refusal,
+        epoch8: event.epoch8,
         version: env!("CARGO_PKG_VERSION"),
+        bytes_out: event.bytes_out,
+        naive_bytes: event.naive_bytes,
     };
     let json = serde_json::to_string(&line).map_err(std::io::Error::other)?;
     let mut f = std::fs::OpenOptions::new()
@@ -101,6 +121,11 @@ fn try_record(
 /// Only the fields `gain` actually aggregates — unknown JSON keys (`ts`,
 /// `files`, `edits`, `epoch8`, `version`) are ignored by serde rather than
 /// modeled and left unread, so nothing here can go dead-code-stale.
+/// `bytes_out`/`naive_bytes` are `#[serde(default)]` (Task 15): an
+/// OLD-format line written before this task simply lacks the keys, and
+/// must still parse — not error out, not degrade the rest of the line —
+/// same posture `ms`/`refusal` already take for a line missing THOSE
+/// keys.
 #[derive(serde::Deserialize)]
 struct MetricRecord {
     verb: String,
@@ -108,6 +133,10 @@ struct MetricRecord {
     ms: u64,
     #[serde(default)]
     refusal: Option<String>,
+    #[serde(default)]
+    bytes_out: Option<u64>,
+    #[serde(default)]
+    naive_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -118,9 +147,39 @@ pub struct VerbStats {
     pub refusals: BTreeMap<String, usize>,
 }
 
+/// Read-side gain accounting (Task 15, spec §7.2's counterfactual): what
+/// the read verbs (`query`/`outline`/`read`) actually cost the caller
+/// (`bytes_out`, summed) versus what reading the same files naively would
+/// have cost (`naive`, summed) — over every metrics line carrying BOTH
+/// fields, old-format lines and non-read-verb lines (which never set
+/// either field) contributing nothing. `saved` is the sum of PER-LINE
+/// `naive_bytes.saturating_sub(bytes_out)` — a line where `bytes_out`
+/// exceeds `naive_bytes` (pathological, but not impossible) clamps to a
+/// `0` delta for that line alone, never going negative and eating into
+/// another line's real savings.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReadSavings {
+    pub saved: u64,
+    pub naive: u64,
+    pub calls: usize,
+}
+
+impl ReadSavings {
+    /// Percent of `naive` that `saved` recovers, floored to an integer —
+    /// `0` (not NaN/a panic) when `naive` is `0` (no qualifying lines
+    /// yet).
+    pub fn pct(&self) -> u64 {
+        self.saved
+            .saturating_mul(100)
+            .checked_div(self.naive)
+            .unwrap_or(0)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct GainReport {
     pub verbs: BTreeMap<String, VerbStats>,
+    pub read_savings: ReadSavings,
     /// Per-day invocation totals, across every verb. `Some` (possibly
     /// empty) only when `--history` was requested.
     pub history: Option<BTreeMap<String, usize>>,
@@ -148,6 +207,7 @@ pub fn aggregate(root: &Path, with_history: bool) -> GainReport {
     let mut per_verb_ms: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     let mut per_verb_refusals: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
     let mut history: BTreeMap<String, usize> = BTreeMap::new();
+    let mut read_savings = ReadSavings::default();
 
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
@@ -171,6 +231,18 @@ pub fn aggregate(root: &Path, with_history: bool) -> GainReport {
                 let Ok(rec) = serde_json::from_str::<MetricRecord>(line) else {
                     continue;
                 };
+                // Read-side gain (Task 15): only a line carrying BOTH
+                // fields contributes — an old-format line (`#[serde(default)]`
+                // leaves both `None`) or a non-read-verb line (which never
+                // sets either) is silently excluded, exactly the spec's "over
+                // lines having both fields" rule. Each line's own delta is
+                // clamped to 0 before summing (`saturating_sub`), so one
+                // pathological line can't eat into another's real savings.
+                if let (Some(bytes_out), Some(naive_bytes)) = (rec.bytes_out, rec.naive_bytes) {
+                    read_savings.saved += naive_bytes.saturating_sub(bytes_out);
+                    read_savings.naive += naive_bytes;
+                    read_savings.calls += 1;
+                }
                 per_verb_ms
                     .entry(rec.verb.clone())
                     .or_default()
@@ -206,15 +278,17 @@ pub fn aggregate(root: &Path, with_history: bool) -> GainReport {
 
     GainReport {
         verbs,
+        read_savings,
         history: with_history.then_some(history),
     }
 }
 
 /// Small fixed-width table, one row per verb, plus a refusal-kind
-/// breakdown line for any verb that had refusals, the M1 "reads:
-/// n/a until M2" counterfactual placeholder (§7.2's token/byte-savings
-/// block arrives with the read verbs in M2), and — when `--history` was
-/// passed — per-day totals.
+/// breakdown line for any verb that had refusals, the Task 15 read-side
+/// gain counterfactual (§7.2) as a single `read savings: ...` line
+/// (superseding the M1 "reads: n/a until M2" placeholder now that the
+/// read verbs actually record `bytes_out`/`naive_bytes`), and — when
+/// `--history` was passed — per-day totals.
 pub fn format_human(report: &GainReport) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -236,7 +310,13 @@ pub fn format_human(report: &GainReport) -> String {
             }
         }
     }
-    let _ = writeln!(out, "reads: n/a until M2");
+    let _ = writeln!(
+        out,
+        "read savings: {} bytes ({}%) across {} read-verb calls",
+        report.read_savings.saved,
+        report.read_savings.pct(),
+        report.read_savings.calls
+    );
     if let Some(hist) = &report.history {
         let _ = writeln!(out, "\nhistory (per-day totals):");
         if hist.is_empty() {
@@ -268,7 +348,12 @@ pub fn to_json(report: &GainReport) -> serde_json::Value {
         .collect();
     let mut obj = serde_json::json!({
         "verbs": verbs,
-        "reads": "n/a until M2",
+        "read_savings": {
+            "saved": report.read_savings.saved,
+            "naive": report.read_savings.naive,
+            "pct": report.read_savings.pct(),
+            "calls": report.read_savings.calls,
+        },
     });
     if let Some(hist) = &report.history {
         obj["history"] = serde_json::json!(hist);
@@ -279,6 +364,31 @@ pub fn to_json(report: &GainReport) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Positional shorthand for the tests only: production call sites use
+    /// the named `MetricEvent` fields, which is the point of the struct.
+    #[allow(clippy::too_many_arguments)]
+    fn ev<'a>(
+        verb: &'a str,
+        ms: u64,
+        files: usize,
+        edits: usize,
+        refusal: Option<&'a str>,
+        epoch8: &'a str,
+        bytes_out: Option<u64>,
+        naive_bytes: Option<u64>,
+    ) -> MetricEvent<'a> {
+        MetricEvent {
+            verb,
+            ms,
+            files,
+            edits,
+            refusal,
+            epoch8,
+            bytes_out,
+            naive_bytes,
+        }
+    }
 
     #[test]
     fn civil_from_days_matches_known_anchors() {
@@ -308,9 +418,9 @@ mod tests {
     fn record_then_aggregate_round_trips_count_and_refusals() {
         let d = tempfile::tempdir().unwrap();
         let r = d.path();
-        record(r, "apply", 10, 2, 3, None, "abcd1234");
-        record(r, "apply", 20, 1, 1, Some("stale"), "");
-        record(r, "status", 5, 0, 0, None, "abcd1234");
+        record(r, &ev("apply", 10, 2, 3, None, "abcd1234", None, None));
+        record(r, &ev("apply", 20, 1, 1, Some("stale"), "", None, None));
+        record(r, &ev("status", 5, 0, 0, None, "abcd1234", None, None));
 
         let report = aggregate(r, false);
         assert_eq!(report.verbs["apply"].count, 2);
@@ -335,7 +445,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let r = d.path();
         std::fs::write(r.join(".vc"), "not a directory").unwrap();
-        record(r, "status", 1, 0, 0, None, "");
+        record(r, &ev("status", 1, 0, 0, None, "", None, None));
         // No panic reaching here is the assertion.
     }
 
@@ -353,5 +463,101 @@ mod tests {
         let report = aggregate(r, false);
         assert_eq!(report.verbs["status"].count, 1);
         assert_eq!(report.verbs["status"].p50_ms, 7);
+    }
+
+    /// Task 15: a query/outline/read invocation records `bytes_out` and
+    /// `naive_bytes`, and `aggregate` sums them into `read_savings` —
+    /// `saved` = Σ(naive_bytes - bytes_out) clamped per-line at 0, `naive`
+    /// = Σ naive_bytes, `calls` = the count of qualifying lines. A verb
+    /// that never sets either field (`status`) must not contribute.
+    #[test]
+    fn record_with_read_gain_fields_aggregates_into_read_savings() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        record(
+            r,
+            &ev("query", 5, 1, 3, None, "abcd1234", Some(40), Some(100)),
+        );
+        record(
+            r,
+            &ev("read", 3, 1, 0, None, "abcd1234", Some(20), Some(50)),
+        );
+        record(r, &ev("status", 1, 0, 0, None, "abcd1234", None, None));
+
+        let report = aggregate(r, false);
+        assert_eq!(report.read_savings.calls, 2);
+        assert_eq!(report.read_savings.naive, 150);
+        assert_eq!(report.read_savings.saved, 90); // (100-40) + (50-20)
+        assert_eq!(report.read_savings.pct(), 60); // 90*100/150
+    }
+
+    /// A pathological line where `bytes_out` exceeds `naive_bytes` clamps
+    /// ONLY that line's own delta to 0 — it must never subtract from
+    /// another line's real, positive savings.
+    #[test]
+    fn negative_per_line_delta_clamps_to_zero_not_the_whole_sum() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        record(r, &ev("query", 1, 1, 1, None, "e", Some(120), Some(100)));
+        record(r, &ev("query", 1, 1, 1, None, "e", Some(10), Some(50)));
+
+        let report = aggregate(r, false);
+        assert_eq!(report.read_savings.calls, 2);
+        assert_eq!(report.read_savings.saved, 40); // 0 + 40, never -20 + 40
+    }
+
+    /// An OLD-format metrics line (written before Task 15, missing the
+    /// `bytes_out`/`naive_bytes` keys entirely) must still parse and count
+    /// toward its verb's ordinary stats — and must not contribute to
+    /// `read_savings`, since it has neither field.
+    #[test]
+    fn old_format_line_without_read_gain_fields_still_parses() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        let dir = metrics_dir(r);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("2026-08-01.jsonl"),
+            "{\"ts\":1,\"verb\":\"query\",\"ms\":5,\"files\":1,\"edits\":1,\"refusal\":null,\"epoch8\":\"e\",\"version\":\"0.0.1\"}\n",
+        )
+        .unwrap();
+
+        let report = aggregate(r, false);
+        assert_eq!(
+            report.verbs["query"].count, 1,
+            "an old-format line must still count toward its verb's stats"
+        );
+        assert_eq!(
+            report.read_savings.calls, 0,
+            "an old-format line has neither field, so it must not contribute to read savings"
+        );
+    }
+
+    #[test]
+    fn format_human_includes_read_savings_line() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        record(r, &ev("query", 1, 1, 1, None, "e", Some(40), Some(100)));
+
+        let report = aggregate(r, false);
+        let human = format_human(&report);
+        assert!(
+            human.contains("read savings: 60 bytes (60%) across 1 read-verb calls"),
+            "got: {human}"
+        );
+    }
+
+    #[test]
+    fn to_json_includes_read_savings_object() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        record(r, &ev("outline", 1, 1, 0, None, "e", Some(40), Some(100)));
+
+        let report = aggregate(r, false);
+        let json = to_json(&report);
+        assert_eq!(json["read_savings"]["saved"], 60);
+        assert_eq!(json["read_savings"]["naive"], 100);
+        assert_eq!(json["read_savings"]["calls"], 1);
+        assert_eq!(json["read_savings"]["pct"], 60);
     }
 }
