@@ -58,48 +58,39 @@ struct MetricLine<'a> {
     naive_bytes: Option<u64>,
 }
 
-/// Append one metrics line for this invocation. Never fails outward: any
-/// I/O error (unwritable `.vc/`, full disk, ...) is silently dropped —
-/// see the module doc comment. `bytes_out`/`naive_bytes` are the Task 15
-/// read-side gain fields — `Some` only for `query`/`outline`/`read`
-/// (`CmdOutcome::bytes_out`/`::naive_bytes`), `None` for every other verb.
-#[allow(clippy::too_many_arguments)]
-pub fn record(
-    root: &Path,
-    verb: &str,
-    ms: u64,
-    files: usize,
-    edits: usize,
-    refusal: Option<&str>,
-    epoch8: &str,
-    bytes_out: Option<u64>,
-    naive_bytes: Option<u64>,
-) {
-    let _ = try_record(
-        root,
-        verb,
-        ms,
-        files,
-        edits,
-        refusal,
-        epoch8,
-        bytes_out,
-        naive_bytes,
-    );
+/// One invocation's worth of metrics, as a named struct rather than a
+/// nine-argument positional list.
+///
+/// Every field but `verb` is a scalar, and four of them are numbers of
+/// the same two types — so a transposed pair (`files`/`edits`,
+/// `bytes_out`/`naive_bytes`) type-checks perfectly and silently corrupts
+/// the metric it lands in. Naming them at the call site is what makes
+/// that a visible mistake instead of an invisible one, and it retires the
+/// three `#[allow(clippy::too_many_arguments)]` suppressions that were
+/// standing in for this.
+pub struct MetricEvent<'a> {
+    pub verb: &'a str,
+    pub ms: u64,
+    pub files: usize,
+    pub edits: usize,
+    pub refusal: Option<&'a str>,
+    pub epoch8: &'a str,
+    /// Read-side gain accounting (Task 15) — `Some` only for the read
+    /// verbs (`query`/`outline`/`read`), from `CmdOutcome::bytes_out`.
+    pub bytes_out: Option<u64>,
+    /// The counterfactual half of the same accounting, from
+    /// `CmdOutcome::naive_bytes`. `Some` only alongside `bytes_out`.
+    pub naive_bytes: Option<u64>,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn try_record(
-    root: &Path,
-    verb: &str,
-    ms: u64,
-    files: usize,
-    edits: usize,
-    refusal: Option<&str>,
-    epoch8: &str,
-    bytes_out: Option<u64>,
-    naive_bytes: Option<u64>,
-) -> std::io::Result<()> {
+/// Append one metrics line for this invocation. Never fails outward: any
+/// I/O error (unwritable `.vc/`, full disk, ...) is silently dropped —
+/// see the module doc comment.
+pub fn record(root: &Path, event: &MetricEvent<'_>) {
+    let _ = try_record(root, event);
+}
+
+fn try_record(root: &Path, event: &MetricEvent<'_>) -> std::io::Result<()> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -109,15 +100,15 @@ fn try_record(
     let path = dir.join(format!("{}.jsonl", date_string(ts)));
     let line = MetricLine {
         ts,
-        verb,
-        ms,
-        files,
-        edits,
-        refusal,
-        epoch8,
+        verb: event.verb,
+        ms: event.ms,
+        files: event.files,
+        edits: event.edits,
+        refusal: event.refusal,
+        epoch8: event.epoch8,
         version: env!("CARGO_PKG_VERSION"),
-        bytes_out,
-        naive_bytes,
+        bytes_out: event.bytes_out,
+        naive_bytes: event.naive_bytes,
     };
     let json = serde_json::to_string(&line).map_err(std::io::Error::other)?;
     let mut f = std::fs::OpenOptions::new()
@@ -374,6 +365,31 @@ pub fn to_json(report: &GainReport) -> serde_json::Value {
 mod tests {
     use super::*;
 
+    /// Positional shorthand for the tests only: production call sites use
+    /// the named `MetricEvent` fields, which is the point of the struct.
+    #[allow(clippy::too_many_arguments)]
+    fn ev<'a>(
+        verb: &'a str,
+        ms: u64,
+        files: usize,
+        edits: usize,
+        refusal: Option<&'a str>,
+        epoch8: &'a str,
+        bytes_out: Option<u64>,
+        naive_bytes: Option<u64>,
+    ) -> MetricEvent<'a> {
+        MetricEvent {
+            verb,
+            ms,
+            files,
+            edits,
+            refusal,
+            epoch8,
+            bytes_out,
+            naive_bytes,
+        }
+    }
+
     #[test]
     fn civil_from_days_matches_known_anchors() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
@@ -402,9 +418,9 @@ mod tests {
     fn record_then_aggregate_round_trips_count_and_refusals() {
         let d = tempfile::tempdir().unwrap();
         let r = d.path();
-        record(r, "apply", 10, 2, 3, None, "abcd1234", None, None);
-        record(r, "apply", 20, 1, 1, Some("stale"), "", None, None);
-        record(r, "status", 5, 0, 0, None, "abcd1234", None, None);
+        record(r, &ev("apply", 10, 2, 3, None, "abcd1234", None, None));
+        record(r, &ev("apply", 20, 1, 1, Some("stale"), "", None, None));
+        record(r, &ev("status", 5, 0, 0, None, "abcd1234", None, None));
 
         let report = aggregate(r, false);
         assert_eq!(report.verbs["apply"].count, 2);
@@ -429,7 +445,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let r = d.path();
         std::fs::write(r.join(".vc"), "not a directory").unwrap();
-        record(r, "status", 1, 0, 0, None, "", None, None);
+        record(r, &ev("status", 1, 0, 0, None, "", None, None));
         // No panic reaching here is the assertion.
     }
 
@@ -458,9 +474,15 @@ mod tests {
     fn record_with_read_gain_fields_aggregates_into_read_savings() {
         let d = tempfile::tempdir().unwrap();
         let r = d.path();
-        record(r, "query", 5, 1, 3, None, "abcd1234", Some(40), Some(100));
-        record(r, "read", 3, 1, 0, None, "abcd1234", Some(20), Some(50));
-        record(r, "status", 1, 0, 0, None, "abcd1234", None, None);
+        record(
+            r,
+            &ev("query", 5, 1, 3, None, "abcd1234", Some(40), Some(100)),
+        );
+        record(
+            r,
+            &ev("read", 3, 1, 0, None, "abcd1234", Some(20), Some(50)),
+        );
+        record(r, &ev("status", 1, 0, 0, None, "abcd1234", None, None));
 
         let report = aggregate(r, false);
         assert_eq!(report.read_savings.calls, 2);
@@ -476,8 +498,8 @@ mod tests {
     fn negative_per_line_delta_clamps_to_zero_not_the_whole_sum() {
         let d = tempfile::tempdir().unwrap();
         let r = d.path();
-        record(r, "query", 1, 1, 1, None, "e", Some(120), Some(100));
-        record(r, "query", 1, 1, 1, None, "e", Some(10), Some(50));
+        record(r, &ev("query", 1, 1, 1, None, "e", Some(120), Some(100)));
+        record(r, &ev("query", 1, 1, 1, None, "e", Some(10), Some(50)));
 
         let report = aggregate(r, false);
         assert_eq!(report.read_savings.calls, 2);
@@ -515,7 +537,7 @@ mod tests {
     fn format_human_includes_read_savings_line() {
         let d = tempfile::tempdir().unwrap();
         let r = d.path();
-        record(r, "query", 1, 1, 1, None, "e", Some(40), Some(100));
+        record(r, &ev("query", 1, 1, 1, None, "e", Some(40), Some(100)));
 
         let report = aggregate(r, false);
         let human = format_human(&report);
@@ -529,7 +551,7 @@ mod tests {
     fn to_json_includes_read_savings_object() {
         let d = tempfile::tempdir().unwrap();
         let r = d.path();
-        record(r, "outline", 1, 1, 0, None, "e", Some(40), Some(100));
+        record(r, &ev("outline", 1, 1, 0, None, "e", Some(40), Some(100)));
 
         let report = aggregate(r, false);
         let json = to_json(&report);

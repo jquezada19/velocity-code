@@ -58,7 +58,9 @@ impl StatIndex {
     /// Every read verb (`query`/`outline`/`read`) calls `refresh`, which
     /// calls this — so concurrent `vc` invocations in one repo can call
     /// `save` at the same time. Writes go to a uniquely-named temp sibling
-    /// in `.vc/` first, fsynced, then `rename`d into place (same
+    /// in `.vc/` first (created with `create_new`, so a name collision
+    /// fails and retries rather than truncating another writer's temp file
+    /// — see [`create_temp_file`]), fsynced, then `rename`d into place (same
     /// write-temp-then-rename discipline as `journal::write_entry`): a
     /// rename onto an existing path is atomic on the same filesystem, so
     /// `StatIndex::load` can never observe a torn (valid-header,
@@ -78,23 +80,64 @@ impl StatIndex {
         bytes.extend_from_slice(&INDEX_VERSION.to_le_bytes());
         bytes.extend_from_slice(&body);
 
+        let (tmp, mut f) = create_temp_file(&dir)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, index_path(root))?;
+        fsync_dir(&dir)?;
+        Ok(())
+    }
+}
+
+/// How many suffixes [`create_temp_file`] will try before giving up.
+/// A collision needs two writers to pick the same pid AND the same
+/// nanosecond, so one retry would almost certainly do; a handful costs
+/// nothing and keeps the loop from being a coin flip.
+const TEMP_CREATE_ATTEMPTS: u32 = 8;
+
+/// Create a uniquely-named temp file in `dir` with `create_new(true)`, so
+/// the open FAILS on collision rather than truncating whatever is already
+/// there.
+///
+/// The name is pid + nanosecond, which is unique in practice but is not a
+/// guarantee: two `vc` processes can be issued the same pid on different
+/// hosts sharing a filesystem, and a coarse clock can repeat a
+/// nanosecond. `File::create` would silently truncate the other writer's
+/// half-written temp file and both would then rename over each other —
+/// the index is a cache, so the damage is bounded, but "bounded damage"
+/// is not the same as "cannot happen". `create_new` turns the collision
+/// into an `AlreadyExists` error, which this retries with a fresh suffix;
+/// only a genuinely different I/O error propagates.
+fn create_temp_file(dir: &Path) -> VcResult<(PathBuf, std::fs::File)> {
+    let mut last_err = None;
+    for attempt in 0..TEMP_CREATE_ATTEMPTS {
         let tmp = dir.join(format!(
-            "index.tmp.{}.{}",
+            "index.tmp.{}.{}.{attempt}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
         {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last_err = Some(e),
+            Err(e) => return Err(e.into()),
         }
-        std::fs::rename(&tmp, index_path(root))?;
-        fsync_dir(&dir)?;
-        Ok(())
     }
+    Err(crate::VcError::new(
+        crate::ErrorKind::Io,
+        format!(
+            "index: could not create a temp file in {} after {TEMP_CREATE_ATTEMPTS} attempts{}",
+            dir.display(),
+            last_err.map(|e| format!(": {e}")).unwrap_or_default()
+        ),
+    ))
 }
 
 fn mtime_ns(md: &std::fs::Metadata) -> i128 {
@@ -230,6 +273,44 @@ mod tests {
             loaded.entries[&PathBuf::from("a.rs")].hash,
             crate::hash::bytes_hash(b"one")
         );
+    }
+
+    /// The temp file is opened with `create_new`, so an existing file at
+    /// the chosen name is never truncated — the writer picks a different
+    /// name instead. Simulated directly by pre-creating every name the
+    /// first attempt could pick is impossible (the suffix carries a
+    /// nanosecond), so this pins the property that matters: an unrelated
+    /// pre-existing `index.tmp.*` file with content of its own survives a
+    /// save untouched.
+    #[test]
+    fn save_never_truncates_an_existing_temp_sibling() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        std::fs::create_dir_all(r.join(".vc")).unwrap();
+        std::fs::write(r.join("a.rs"), "one").unwrap();
+
+        let squatter = r.join(".vc/index.tmp.99999.1.0");
+        std::fs::write(&squatter, b"another writer's half-written temp").unwrap();
+
+        refresh(r).unwrap();
+
+        assert_eq!(
+            std::fs::read(&squatter).unwrap(),
+            b"another writer's half-written temp",
+            "save must never write over a temp file it did not create"
+        );
+        assert!(r.join(".vc/index").is_file());
+    }
+
+    /// `create_temp_file` hands back a distinct path every call, so two
+    /// writers in the same process cannot collide on a name.
+    #[test]
+    fn create_temp_file_returns_distinct_paths() {
+        let d = tempfile::tempdir().unwrap();
+        let (p1, _f1) = create_temp_file(d.path()).unwrap();
+        let (p2, _f2) = create_temp_file(d.path()).unwrap();
+        assert_ne!(p1, p2);
+        assert!(p1.is_file() && p2.is_file());
     }
 
     #[test]

@@ -186,13 +186,15 @@ fn dispatch(root: &Path, cwd: &Path, cmd: &Cmd) -> VcResult<CmdOutcome> {
         } => cmd_query(
             root,
             cwd,
-            pattern,
-            *regex,
-            *symbol,
-            *ast,
-            lang.as_deref(),
-            *budget,
-            paths,
+            QueryArgs {
+                pattern,
+                regex: *regex,
+                symbol: *symbol,
+                ast: *ast,
+                lang: lang.as_deref(),
+                budget: *budget,
+                paths,
+            },
         ),
         Cmd::Outline { path, budget } => cmd_outline(root, cwd, path, *budget),
         Cmd::Read {
@@ -899,18 +901,16 @@ fn naive_bytes_for_files<'a>(
 /// `cmd_doctor`'s `--rollback`/`--discard` check. `--ast` switches to
 /// structural search (`cmd_query_ast`), the same `ast-grep` engine `plan
 /// match` uses — literally the dry-run of the edit.
-#[allow(clippy::too_many_arguments)]
-fn cmd_query(
-    root: &Path,
-    cwd: &Path,
-    pattern: &str,
-    regex: bool,
-    symbol: bool,
-    ast: bool,
-    lang: Option<&str>,
-    budget: Option<usize>,
-    paths: &[std::path::PathBuf],
-) -> VcResult<CmdOutcome> {
+fn cmd_query(root: &Path, cwd: &Path, args: QueryArgs<'_>) -> VcResult<CmdOutcome> {
+    let QueryArgs {
+        pattern,
+        regex,
+        symbol,
+        ast,
+        lang,
+        budget,
+        paths,
+    } = args;
     if [symbol, regex, ast].iter().filter(|&&b| b).count() > 1 {
         return Err(VcError::new(
             ErrorKind::Usage,
@@ -939,6 +939,20 @@ fn cmd_query(
         velocity_code_query::search_literal(root, pattern, &scope)?
     };
     Ok(query_hits_outcome(root, &hits, budget, epoch8, warnings))
+}
+
+/// `vc query`'s parsed arguments, carried as one named value rather than
+/// seven positional ones. Three of them are bare `bool`s that a caller
+/// could transpose without the compiler noticing — and transposing
+/// `symbol` with `ast` silently changes which search mode runs.
+struct QueryArgs<'a> {
+    pattern: &'a str,
+    regex: bool,
+    symbol: bool,
+    ast: bool,
+    lang: Option<&'a str>,
+    budget: Option<usize>,
+    paths: &'a [std::path::PathBuf],
 }
 
 /// The shared tail of every `Vec<QueryHit>` search mode — literal, regex
@@ -1322,9 +1336,16 @@ fn cmd_read_path(
         None => (1, total),
     };
 
-    read_outcome(
-        &path_disp, &lines, start, end, &content, epoch8, budget, None,
-    )
+    read_outcome(ReadRender {
+        path_disp: &path_disp,
+        lines: &lines,
+        start,
+        end,
+        naive_bytes: content.len() as u64,
+        epoch8,
+        budget,
+        warning: None,
+    })
 }
 
 /// `--symbol NAME` `read` mode: unique EXACT match -> its full body, line-
@@ -1399,34 +1420,53 @@ fn cmd_read_symbol(root: &Path, name: &str, budget: Option<usize>) -> VcResult<C
     // Same non-fatal-warning posture as `cmd_query_symbol`: a malformed
     // file elsewhere in the search must not fail a read that found its
     // target fine.
-    read_outcome(
-        &path_disp,
-        &lines,
+    read_outcome(ReadRender {
+        path_disp: &path_disp,
+        lines: &lines,
         start,
         end,
-        &content,
+        naive_bytes: content.len() as u64,
         epoch8,
         budget,
-        join_warnings(warnings),
-    )
+        warning: join_warnings(warnings),
+    })
+}
+
+/// What a `read` resolved to, ready to render. The two modes differ only
+/// in how they arrive at a path and a line range; from here on they are
+/// the same command. Named fields rather than a positional list because
+/// `start`/`end` are adjacent same-typed numbers and the whole point of
+/// this verb is returning exactly the lines that were asked for.
+struct ReadRender<'a> {
+    path_disp: &'a str,
+    lines: &'a [&'a str],
+    start: usize,
+    end: usize,
+    /// The full file's byte length — the read-gain counterfactual ("what
+    /// reading the whole thing would have cost"), not the size of what is
+    /// actually returned.
+    naive_bytes: u64,
+    epoch8: String,
+    budget: Option<usize>,
+    warning: Option<String>,
 }
 
 /// The shared tail of both `read` modes: render lines `start..=end` with
 /// their `{line}: ` prefixes, apply the budget refusal, then build the
 /// identical human text, `--json` shape (`{epoch8, path, start, end,
-/// text}`) and read-gain accounting. The two modes differ only in how they
-/// arrive at a path and a line range.
-#[allow(clippy::too_many_arguments)]
-fn read_outcome(
-    path_disp: &str,
-    lines: &[&str],
-    start: usize,
-    end: usize,
-    content: &str,
-    epoch8: String,
-    budget: Option<usize>,
-    warning: Option<String>,
-) -> VcResult<CmdOutcome> {
+/// text}`) and read-gain accounting.
+fn read_outcome(r: ReadRender<'_>) -> VcResult<CmdOutcome> {
+    let ReadRender {
+        path_disp,
+        lines,
+        start,
+        end,
+        naive_bytes,
+        epoch8,
+        budget,
+        warning,
+    } = r;
+
     let mut text = String::new();
     for i in start..=end {
         if !text.is_empty() {
@@ -1451,7 +1491,6 @@ fn read_outcome(
     });
 
     let bytes_out = human.len() as u64;
-    let naive_bytes = content.len() as u64;
 
     Ok(CmdOutcome {
         human,
@@ -1537,14 +1576,16 @@ fn main() {
     };
     metrics::record(
         &repo_root,
-        verb,
-        ms,
-        files,
-        edits,
-        refusal,
-        &epoch8,
-        bytes_out,
-        naive_bytes,
+        &metrics::MetricEvent {
+            verb,
+            ms,
+            files,
+            edits,
+            refusal,
+            epoch8: &epoch8,
+            bytes_out,
+            naive_bytes,
+        },
     );
 
     let code = output::emit(cli.json, &result);
