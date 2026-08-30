@@ -40,7 +40,16 @@ pub fn file_hash_io(path: &Path) -> std::io::Result<String> {
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; HASH_CHUNK_BYTES];
     loop {
-        let n = file.read(&mut buf)?;
+        // `Interrupted` is a retry, never a failure: it means a signal
+        // arrived mid-read, not that the read cannot be done. The whole-
+        // file `fs::read` this loop replaced retried it internally, so
+        // surfacing it here would be a regression introduced by the
+        // streaming rewrite — a `vc status` that failed on a stray SIGWINCH.
+        let n = match file.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             break;
         }

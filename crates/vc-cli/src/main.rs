@@ -1619,16 +1619,28 @@ fn cmd_read_symbol(root: &Path, name: &str, budget: Option<usize>) -> VcResult<C
 ///
 /// `cmd_read_symbol` reads the file TWICE: once inside `search_symbol`, to
 /// parse out the symbol table, and again here to render the body. The file
-/// can shrink in between. `end` was already clamped to the file's true
-/// length, but `start` was not — so a file truncated in that window
-/// produced an inverted `start > end` range, which renders as an empty
-/// body under a header claiming a span that no longer exists, at exit 0. A
-/// caller was told nothing was wrong and handed nothing.
+/// can shrink in between, and a span from that first read then names lines
+/// the second read does not have.
 ///
-/// `start` past the file's end is therefore `NotFound`, naming the true
-/// length and the fact that the file moved; `end` past it still clamps,
-/// which is the ordinary "the symbol's last line is the file's last line"
-/// case and not an error.
+/// **A span from a lookup must be FULLY present, or it is not that
+/// symbol's body.** So `start > total` and `end > total` are equally
+/// `NotFound`, naming the true length and the fact that the file moved.
+/// Clamping `end` — which is what this used to do — was the subtler half
+/// of the same bug the `start` check already refused: a file truncated
+/// mid-symbol returned lines `start..=total` at exit 0, under a header
+/// claiming the requested range, with no marker that the body was cut
+/// short. The caller asked for a symbol and was handed a fragment labelled
+/// as the whole thing.
+///
+/// This is NOT a general "clamp ranges to the file" rule, and clamping
+/// deliberately survives in `cmd_read_path`: there the range is typed by
+/// the caller, who is guessing at the file and is well served by getting
+/// the part that exists. Here the range came from a lookup this command
+/// performed itself, moments ago, against the same file — if it no longer
+/// fits, the premise is stale and the answer is a refusal, not a subset.
+///
+/// `start == end == total` is the boundary and is still valid: it names
+/// the file's final line, which is present.
 fn resolve_symbol_span(
     path_disp: &str,
     name: &str,
@@ -1636,7 +1648,7 @@ fn resolve_symbol_span(
     start: usize,
     end: usize,
 ) -> VcResult<(usize, usize)> {
-    if start > total {
+    if start > total || end > total {
         return Err(VcError::new(
             ErrorKind::NotFound,
             format!(
@@ -1646,7 +1658,7 @@ fn resolve_symbol_span(
         )
         .with_next(format!("vc query {name} --symbol")));
     }
-    Ok((start, end.min(total)))
+    Ok((start, end))
 }
 
 /// What a `read` resolved to, ready to render. The two modes differ only
@@ -1844,20 +1856,45 @@ mod tests {
         assert_eq!(err.next.as_deref(), Some("vc query target --symbol"));
     }
 
-    /// The ordinary cases the refusal must not swallow: a span that fits
-    /// is returned unchanged, and an `end` past EOF still CLAMPS — that is
-    /// the everyday "the symbol's last line is the file's last line" case,
-    /// not a race. `start == total` is the boundary and is still valid: it
-    /// names the file's final line.
+    /// The other half of the shrink race, and the discriminating one: a
+    /// span whose START still fits but whose END does not. Clamping it —
+    /// the previous behaviour — returned lines 40..=50 of a symbol that
+    /// ran to 52, at exit 0, with nothing marking the body as truncated.
+    /// A span from a lookup must be fully present or it is not that
+    /// symbol's body, so this refuses too.
     #[test]
-    fn a_symbol_span_within_the_file_is_returned_and_only_the_end_clamps() {
+    fn a_symbol_span_whose_end_is_past_eof_refuses_instead_of_truncating() {
+        let err = resolve_symbol_span("a.rs", "target", 50, 40, 52).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::NotFound);
+        assert_eq!(err.exit_code(), 1);
+        assert!(
+            err.message
+                .contains("symbol span 40-52 beyond EOF (50 lines)"),
+            "the refusal names the span and the file's true length: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("file changed since lookup"),
+            "...and says why: {}",
+            err.message
+        );
+    }
+
+    /// The ordinary case the refusal must not swallow: a span that fits
+    /// entirely is returned UNCHANGED — no clamping of either end, because
+    /// there is nothing to clamp. `start == end == total` is the boundary
+    /// and is still valid: it names the file's final line, which exists.
+    #[test]
+    fn a_symbol_span_within_the_file_is_returned_unchanged() {
         assert_eq!(
             resolve_symbol_span("a.rs", "t", 100, 40, 52).unwrap(),
             (40, 52)
         );
+        // The span ending exactly at EOF is the everyday "the symbol's
+        // last line is the file's last line" case, and is not a race.
         assert_eq!(
-            resolve_symbol_span("a.rs", "t", 50, 40, 52).unwrap(),
-            (40, 50)
+            resolve_symbol_span("a.rs", "t", 52, 40, 52).unwrap(),
+            (40, 52)
         );
         assert_eq!(
             resolve_symbol_span("a.rs", "t", 40, 40, 40).unwrap(),
