@@ -87,6 +87,60 @@ fn import_flows_through_same_engine() {
     );
 }
 
+/// A diff import whose old text occurs MORE THAN ONCE in the file is
+/// resolvable only because the hunk header's line hint picks the right
+/// occurrence. `plan refresh` must reuse that stored hint: refreshing on a
+/// tree that has not changed at all must reproduce the same plan, not
+/// refuse `Ambiguous`.
+///
+/// Discriminating: with the hint dropped on the way back into
+/// `EditRequest` (the pre-fix behavior), `resolve_edits_with_content`
+/// sees two matches and no hint, which is the `Ambiguous` arm — exit 1 on
+/// an untouched tree, with `vc plan refresh` being the very command the
+/// stale-apply hint tells callers to run.
+#[test]
+fn refresh_of_an_import_with_duplicated_old_text_reuses_the_stored_line_hint() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    // "dup\n" appears on lines 1 and 3 — identical text, two occurrences.
+    std::fs::write(r.join("x.txt"), "dup\nmiddle\ndup\n").unwrap();
+
+    // The hunk names line 3, so the import resolves to the SECOND "dup".
+    let diff = "--- a/x.txt\n+++ b/x.txt\n@@ -3,1 +3,1 @@\n-dup\n+DUP\n";
+    let out = vc(r)
+        .args(["--json", "plan", "import"])
+        .write_stdin(diff)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let sha8 = serde_json::from_slice::<serde_json::Value>(&out).unwrap()["sha8"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Nothing on disk has changed — refresh must simply succeed.
+    let out = vc(r)
+        .args(["--json", "plan", "refresh", &sha8])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let refreshed = v["sha8"].as_str().unwrap().to_string();
+    assert_eq!(v["sites"], 1);
+
+    // And the refreshed plan still edits the occurrence the hint chose.
+    vc(r).args(["apply", &refreshed]).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(r.join("x.txt")).unwrap(),
+        "dup\nmiddle\nDUP\n",
+        "the line hint must still select the second occurrence after a refresh"
+    );
+}
+
 /// Own test: `--json` error shape on a stale apply — exit 3 and a
 /// `{"error":{"kind":"stale",...}}` envelope on STDOUT (not stderr; the
 /// contract routes --json errors to stdout so a machine caller never has

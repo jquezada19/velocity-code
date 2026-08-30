@@ -282,6 +282,69 @@ fn multi_file_drift_attributes_site_count_per_file() {
     );
 }
 
+/// A stored plan that still SAYS `form: Match` but has lost its selector
+/// and certificate must refuse, not apply. The old drift check read the
+/// two halves with `let (Some, Some) = ... else { return Ok(()) }`, so a
+/// plan in exactly this shape skipped the guard silently and went straight
+/// through to the kernel — the one plan shape where skipping is least
+/// defensible.
+///
+/// The tampered file is rewritten under the filename that matches its OWN
+/// recomputed digest, so the content-addressed integrity check passes and
+/// the form check is what has to catch it.
+#[test]
+fn match_form_plan_stripped_of_selector_and_certificate_refuses() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    std::fs::write(r.join("a.rs"), "fn main() { fetch_config(a); }\n").unwrap();
+
+    let (sha8, _v) = plan_match(r, "fetch_config($$$A)", "load_config($$$A)");
+
+    // Strip both halves and re-store under the resulting content's own id.
+    let plans = r.join(".vc/plans");
+    let original = std::fs::read_dir(&plans)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&sha8))
+        })
+        .expect("the stored plan file");
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&original).unwrap()).unwrap();
+    let obj = json.as_object_mut().unwrap();
+    obj.remove("selector");
+    obj.remove("certificate");
+    assert_eq!(
+        json["form"], "Match",
+        "the form claim is what must be caught"
+    );
+
+    // Name the file by the tampered content's OWN digest, computed the way
+    // the kernel computes it, so `Plan::load`'s content-addressed integrity
+    // check passes and the form check is the only thing left to refuse.
+    let id = serde_json::from_value::<velocity_code_kernel::plan::Plan>(json.clone())
+        .expect("a match plan minus its two optional halves still deserializes")
+        .id();
+    std::fs::remove_file(&original).unwrap();
+    std::fs::write(
+        plans.join(format!("{id}.json")),
+        serde_json::to_vec_pretty(&json).unwrap(),
+    )
+    .unwrap();
+
+    let assert = vc(r).args(["apply", &id[..8]]).assert().failure().code(1);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.starts_with("malformed:"), "stderr: {stderr}");
+
+    assert_eq!(
+        std::fs::read_to_string(r.join("a.rs")).unwrap(),
+        "fn main() { fetch_config(a); }\n",
+        "the refusal must leave the tree untouched"
+    );
+}
+
 /// Edit-form plans carry no `certificate`/`selector` — the drift check
 /// must be a no-op for them, not error out on `None.unwrap()` or similar.
 #[test]

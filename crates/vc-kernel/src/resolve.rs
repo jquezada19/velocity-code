@@ -137,6 +137,11 @@ pub fn resolve_edits_with_content(
             end: start + req.old.len(),
             old_b64: b64e(&req.old),
             new_b64: b64e(&req.new),
+            // Carried through so a later re-resolution (`plan refresh`) can
+            // disambiguate the same way this one did — a duplicated old
+            // text that only the hint separates must not become Ambiguous
+            // on an unchanged tree.
+            line_hint: req.line_hint,
         });
     }
     sort_and_refuse_overlaps(&mut out)?;

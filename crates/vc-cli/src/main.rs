@@ -321,7 +321,12 @@ fn cmd_plan(root: &Path, cwd: &Path, form: &PlanCmd) -> VcResult<CmdOutcome> {
                                 path: e.path.clone(),
                                 old: b64d(&e.old_b64)?,
                                 new: b64d(&e.new_b64)?,
-                                line_hint: None,
+                                // The stored hint, not `None`: an imported
+                                // hunk whose old text occurs more than once
+                                // was only resolvable because of it, and
+                                // dropping it here made such a plan refuse
+                                // `Ambiguous` on a tree that never changed.
+                                line_hint: e.line_hint,
                             })
                         })
                         .collect::<VcResult<Vec<EditRequest>>>()?;
@@ -497,6 +502,8 @@ fn plan_match_pipeline(
             end: s.end,
             old_b64: b64e(&s.old),
             new_b64: b64e(&s.new),
+            // A structural match resolves by span, never by a line hint.
+            line_hint: None,
         })
         .collect();
 
@@ -579,8 +586,25 @@ fn cmd_show(root: &Path, sha8: &str) -> VcResult<CmdOutcome> {
 /// is no selector to have drifted.
 fn check_scope_drift(root: &Path, sha8: &str) -> VcResult<()> {
     let plan = Plan::load(root, sha8)?;
-    let (Some(cert), Some(sel)) = (&plan.certificate, &plan.selector) else {
-        return Ok(());
+    // Branch on the plan's declared FORM, never on whether the two
+    // optional halves happen to be present. An edit/import plan has no
+    // selector and is genuinely exempt; a plan that says `Match` and is
+    // missing either half is malformed, and must refuse — treating it as
+    // "nothing to check" would disarm this guard for exactly the plan
+    // shape it exists to police. (`Plan::load` enforces the same
+    // invariant, so this is the second of two locks on the same door.)
+    let (cert, sel) = match plan.form {
+        PlanForm::Edit | PlanForm::Import => return Ok(()),
+        PlanForm::Match => match (&plan.certificate, &plan.selector) {
+            (Some(cert), Some(sel)) => (cert, sel),
+            _ => {
+                return Err(VcError::new(
+                    ErrorKind::Malformed,
+                    format!("plan {sha8}: match-form plan has no selector or certificate"),
+                )
+                .with_next(format!("vc show {sha8}")));
+            }
+        },
     };
 
     // Same walk-then-lang-filter definition `ProvenanceCert::scope_files`

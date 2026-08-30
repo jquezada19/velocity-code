@@ -26,6 +26,24 @@ pub struct ResolvedEdit {
     pub end: usize,
     pub old_b64: String,
     pub new_b64: String,
+    /// The 1-based line the originating [`resolve::EditRequest`] carried
+    /// as its disambiguator, preserved so a later re-resolution of this
+    /// same edit can reuse it. Only a diff import sets one (the hunk
+    /// header's old-side start line); `plan edit` and `plan match` leave
+    /// it `None`.
+    ///
+    /// Without this, `plan refresh` rebuilt every `EditRequest` with
+    /// `line_hint: None`, so an imported hunk whose old text appears more
+    /// than once in the file — planned fine, because the hint picked the
+    /// right occurrence — refreshed to `Ambiguous` against a tree that had
+    /// not changed at all.
+    ///
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]` keeps
+    /// plan-id stability: `None` never serializes, so every `plan edit`
+    /// and `plan match` edit — and every M1-stored plan on disk — hashes
+    /// byte-identically to before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_hint: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,11 +223,20 @@ impl Plan {
     ///
     /// Beyond `build`'s `files`/`realpaths`/`edits`, this also builds a
     /// [`ProvenanceCert`]: every file in the selector's scope (walked via
-    /// `walk::walk_scoped`), hashed — a named/edited file's hash comes
-    /// from `content_by_path`; every other in-scope file is read fresh.
-    /// This is strictly wider than `edits`' file set, since scope can
-    /// (and typically does) include files the selector looked at but
-    /// didn't match.
+    /// `walk::walk_scoped`), hashed. This is strictly wider than `edits`'
+    /// file set, since scope can (and typically does) include files the
+    /// selector looked at but didn't match.
+    ///
+    /// **Every certificate hash comes from `content_by_path`** — the bytes
+    /// the caller's own selector pass read — and never from a fresh read
+    /// here. The walk still determines the scope *set*; it never supplies
+    /// a byte. A scope file absent from the map is a `Usage` refusal
+    /// naming it, not a second read: re-reading an unmatched file at
+    /// certificate time would baseline whatever is on disk *now*, so a
+    /// file changed between the match pass and this walk would be recorded
+    /// post-change with no edit against it — and the apply-time
+    /// scope-drift check, which compares against exactly this baseline,
+    /// would then see no drift and let the apply through.
     ///
     /// `warnings` are the matcher's own per-file skip warnings (Task 13
     /// controller ruling) — stored verbatim on the returned `Plan` so
@@ -284,24 +311,31 @@ impl Plan {
         let generation = ix.generation;
 
         // The certificate covers the selector's whole VISIBLE scope, not
-        // just the files matched edits touch: a named file's hash reuses
-        // the bytes already in `content_by_path` (no second read); every
-        // other selector-visible file is read fresh for its cert hash.
-        // "Visible" = the scope walk filtered to `selector.lang` via
-        // `lang_tag` — see `ProvenanceCert::scope_files`'s doc comment for
-        // why this exact definition matters (Task 14's drift check must
-        // re-derive the identical set).
+        // just the files matched edits touch. "Visible" = the scope walk
+        // filtered to `selector.lang` via `lang_tag` — see
+        // `ProvenanceCert::scope_files`'s doc comment for why this exact
+        // definition matters (Task 14's drift check must re-derive the
+        // identical set). The walk decides WHICH files are in scope; every
+        // HASH comes from `content_by_path`, so the certificate describes
+        // one single read of the scope rather than two reads with a race
+        // between them.
         let scoped = walk::walk_scoped(&root_real, &selector.paths)?;
         let mut scope_files = BTreeMap::new();
         for rel in scoped {
             if crate::lang_tag(&rel) != selector.lang {
                 continue;
             }
-            let file_hash = match content_by_path.get(&rel) {
-                Some(content) => hash::bytes_hash(content),
-                None => hash::file_hash(&root_real.join(&rel))?,
-            };
-            scope_files.insert(rel, file_hash);
+            let content = content_by_path.get(&rel).ok_or_else(|| {
+                VcError::new(
+                    ErrorKind::Usage,
+                    format!(
+                        "{}: in the selector's scope but no content supplied — \
+                         the certificate is built only from the bytes the selector read",
+                        rel.display()
+                    ),
+                )
+            })?;
+            scope_files.insert(rel, hash::bytes_hash(content));
         }
         let certificate = ProvenanceCert {
             epoch: epoch.clone(),
@@ -331,6 +365,36 @@ impl Plan {
         })
     }
 
+    /// The form invariant, enforced on both sides of the store/load
+    /// boundary: `PlanForm::Match` carries BOTH `selector` and
+    /// `certificate`; `PlanForm::Edit`/`Import` carry NEITHER.
+    ///
+    /// Nothing downstream may treat "half a match plan" as a plan it can
+    /// reason about. In particular `check_scope_drift` reads the pair and
+    /// would otherwise have to choose between skipping (which silently
+    /// disarms the apply-time drift guard for a plan that claims to be a
+    /// match) and panicking. Refusing the plan at the boundary removes the
+    /// choice: a Match plan that reaches the drift check always has both
+    /// halves.
+    pub fn validate_form(&self) -> VcResult<()> {
+        let malformed = |m: &str| Err(VcError::new(ErrorKind::Malformed, m.to_string()));
+        match self.form {
+            PlanForm::Match => match (&self.selector, &self.certificate) {
+                (Some(_), Some(_)) => Ok(()),
+                (None, Some(_)) => malformed("match-form plan has no selector"),
+                (Some(_), None) => malformed("match-form plan has no certificate"),
+                (None, None) => malformed("match-form plan has no selector or certificate"),
+            },
+            PlanForm::Edit | PlanForm::Import => {
+                if self.selector.is_some() || self.certificate.is_some() {
+                    malformed("edit/import-form plan carries a selector or certificate")
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
     /// Canonical plan id: sha256 hex over the canonical JSON form of this
     /// struct. Field order is declaration order (stable); BTreeMaps give
     /// sorted keys; there are no floats anywhere in the struct — so this
@@ -349,6 +413,7 @@ impl Plan {
     /// Write `.vc/plans/<full-id>.json` (pretty JSON), creating the
     /// directory as needed. Returns the sha8.
     pub fn store(&self, root: &Path) -> VcResult<String> {
+        self.validate_form()?;
         let dir = plans_dir(root);
         std::fs::create_dir_all(&dir)?;
         let id = self.id();
@@ -404,6 +469,13 @@ impl Plan {
                         "plan file does not match its id",
                     ));
                 }
+                // Integrity says "these bytes are the ones that were
+                // stored"; it says nothing about whether they describe a
+                // coherent plan. A hand-written file can be perfectly
+                // self-consistent and still claim `form: Match` with no
+                // selector — so the form invariant is checked here too,
+                // not only in `store`.
+                plan.validate_form()?;
                 Ok(plan)
             }
             n => Err(VcError::new(
@@ -457,6 +529,7 @@ mod tests {
                 end: 3,
                 old_b64: base64e(b"one"),
                 new_b64: base64e(b"two"),
+                line_hint: None,
             }],
             expected_count: 1,
             created_unix: 1_756_400_000,
@@ -531,6 +604,11 @@ mod tests {
             !json.contains("warnings"),
             "empty warnings must not serialize"
         );
+        assert!(
+            !json.contains("line_hint"),
+            "a None line_hint must not serialize — an edit-form plan's JSON \
+             (and therefore its id) must be byte-identical to the M1 shape"
+        );
     }
 
     /// The stronger half of the regression: a literal M1-era plan JSON
@@ -565,6 +643,126 @@ mod tests {
         assert_eq!(loaded.id(), id);
         assert!(loaded.selector.is_none());
         assert!(loaded.certificate.is_none());
+    }
+
+    /// Write a plan file bypassing `Plan::store`'s own validation, so a
+    /// deliberately incoherent plan can be put on disk and `Plan::load`
+    /// tested against it. The filename is still the plan's true digest, so
+    /// the content-addressed integrity check passes and the FORM check is
+    /// what has to catch it.
+    fn store_bypassing_validation(plan: &Plan, root: &Path) -> String {
+        let dir = plans_dir(root);
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = plan.id();
+        std::fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::to_vec_pretty(plan).unwrap(),
+        )
+        .unwrap();
+        id
+    }
+
+    fn sample_cert() -> ProvenanceCert {
+        ProvenanceCert {
+            epoch: "e".repeat(64),
+            generation: 1,
+            scope_files: [(PathBuf::from("a.rs"), "h".repeat(64))]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// Form invariant, direction 1: `form: Match` with either half missing
+    /// is `Malformed`, at both boundaries. A plan like this previously
+    /// stored and loaded happily, and `check_scope_drift`'s
+    /// `let (Some, Some) = ... else { return Ok(()) }` then SILENTLY
+    /// skipped the apply-time drift guard for it.
+    #[test]
+    fn match_form_plan_missing_selector_or_certificate_is_malformed() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        std::fs::create_dir_all(root.join(".vc")).unwrap();
+
+        for (selector, certificate, what) in [
+            (None, Some(sample_cert()), "no selector"),
+            (Some(sample_selector(vec![])), None, "no certificate"),
+            (None, None, "neither"),
+        ] {
+            let mut p = sample_plan();
+            p.version = 2;
+            p.form = PlanForm::Match;
+            p.selector = selector;
+            p.certificate = certificate;
+
+            let err = p.store(root).unwrap_err();
+            assert!(
+                matches!(err.kind, crate::ErrorKind::Malformed),
+                "store must refuse a match plan with {what}"
+            );
+
+            let id = store_bypassing_validation(&p, root);
+            let err = Plan::load(root, &id).unwrap_err();
+            assert!(
+                matches!(err.kind, crate::ErrorKind::Malformed),
+                "load must refuse a match plan with {what}"
+            );
+            std::fs::remove_file(plans_dir(root).join(format!("{id}.json"))).unwrap();
+        }
+    }
+
+    /// Form invariant, direction 2: an edit/import plan must carry NEITHER
+    /// half. A selector on a plan whose form says `Edit` describes a
+    /// selector run that the form claims never happened.
+    #[test]
+    fn edit_form_plan_carrying_a_selector_or_certificate_is_malformed() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        std::fs::create_dir_all(root.join(".vc")).unwrap();
+
+        for (selector, certificate, what) in [
+            (Some(sample_selector(vec![])), None, "a selector"),
+            (None, Some(sample_cert()), "a certificate"),
+        ] {
+            let mut p = sample_plan(); // form: Edit
+            p.selector = selector;
+            p.certificate = certificate;
+
+            let err = p.store(root).unwrap_err();
+            assert!(
+                matches!(err.kind, crate::ErrorKind::Malformed),
+                "store must refuse an edit plan carrying {what}"
+            );
+
+            let id = store_bypassing_validation(&p, root);
+            let err = Plan::load(root, &id).unwrap_err();
+            assert!(
+                matches!(err.kind, crate::ErrorKind::Malformed),
+                "load must refuse an edit plan carrying {what}"
+            );
+            std::fs::remove_file(plans_dir(root).join(format!("{id}.json"))).unwrap();
+        }
+    }
+
+    /// The control for both directions above: the two well-formed shapes
+    /// still store and load cleanly, so the guard refuses only what it
+    /// should.
+    #[test]
+    fn well_formed_edit_and_match_plans_still_store_and_load() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        std::fs::create_dir_all(root.join(".vc")).unwrap();
+
+        let edit_plan = sample_plan();
+        let sha8 = edit_plan.store(root).unwrap();
+        assert_eq!(Plan::load(root, &sha8).unwrap().id(), edit_plan.id());
+
+        let mut match_plan = sample_plan();
+        match_plan.version = 2;
+        match_plan.form = PlanForm::Match;
+        match_plan.selector = Some(sample_selector(vec![]));
+        match_plan.certificate = Some(sample_cert());
+        let sha8 = match_plan.store(root).unwrap();
+        assert_eq!(Plan::load(root, &sha8).unwrap().id(), match_plan.id());
     }
 
     #[test]
@@ -743,11 +941,17 @@ mod tests {
             end: 6,
             old_b64: base64e(b"one"),
             new_b64: base64e(b"uno"),
+            line_hint: None,
         };
-        let content_by_path: BTreeMap<PathBuf, Vec<u8>> =
-            [(PathBuf::from("a.rs"), b"fn one() {}\n".to_vec())]
-                .into_iter()
-                .collect();
+        // The matcher hands back EVERY scanned file's bytes, not just the
+        // matched one — `notes.txt` is out of the lang filter, so it is
+        // never scanned and never needed.
+        let content_by_path: BTreeMap<PathBuf, Vec<u8>> = [
+            (PathBuf::from("a.rs"), b"fn one() {}\n".to_vec()),
+            (PathBuf::from("b.rs"), b"fn two() {}\n".to_vec()),
+        ]
+        .into_iter()
+        .collect();
         let selector = sample_selector(vec![]);
 
         let p = Plan::build_match(
@@ -787,7 +991,7 @@ mod tests {
         assert_eq!(
             cert.scope_files.get(&PathBuf::from("b.rs")),
             Some(&crate::hash::bytes_hash(b"fn two() {}\n")),
-            "untouched in-scope file must still be covered, read fresh"
+            "untouched in-scope file must still be covered, from the same read"
         );
         assert!(
             !cert.scope_files.contains_key(&PathBuf::from("notes.txt")),
@@ -824,6 +1028,7 @@ mod tests {
             end: 6,
             old_b64: base64e(b"one"),
             new_b64: base64e(b"uno"),
+            line_hint: None,
         };
         let content_by_path: BTreeMap<PathBuf, Vec<u8>> =
             [(PathBuf::from("sub/a.rs"), b"fn one() {}\n".to_vec())]
@@ -838,6 +1043,104 @@ mod tests {
             !cert.scope_files.contains_key(&PathBuf::from("top.rs")),
             "out-of-scope file must not appear in the certificate"
         );
+    }
+
+    /// The certificate is built EXCLUSIVELY from `content_by_path` — the
+    /// bytes the selector's own single read saw — never from a fresh read
+    /// of the tree at certificate time.
+    ///
+    /// Here `b.rs` is in scope, produced no edit, and its ON-DISK content
+    /// differs from the bytes supplied in the map: the certificate must
+    /// record the supplied bytes. The end-to-end race this closes (a file
+    /// mutated between the match pass and the certificate walk being
+    /// baselined post-change) is reproduced against the real matcher in
+    /// `vc-cli`'s `certificate_baselines_the_match_pass_read_not_a_later_one`;
+    /// this pins the kernel half of it.
+    #[test]
+    fn build_match_certificate_hashes_the_supplied_bytes_never_a_fresh_read() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().to_path_buf();
+        std::fs::create_dir_all(r.join(".vc")).unwrap();
+        std::fs::write(r.join("a.rs"), "fn one() {}\n").unwrap();
+        // What the tree holds NOW — i.e. after the selector already read it.
+        std::fs::write(r.join("b.rs"), "fn two() { changed_after_the_scan(); }\n").unwrap();
+
+        // What the selector actually saw for b.rs, before that change.
+        let selector_saw_b = b"fn two() {}\n".to_vec();
+        let content_by_path: BTreeMap<PathBuf, Vec<u8>> = [
+            (PathBuf::from("a.rs"), b"fn one() {}\n".to_vec()),
+            (PathBuf::from("b.rs"), selector_saw_b.clone()),
+        ]
+        .into_iter()
+        .collect();
+
+        let edit = ResolvedEdit {
+            path: PathBuf::from("a.rs"),
+            start: 3,
+            end: 6,
+            old_b64: base64e(b"one"),
+            new_b64: base64e(b"uno"),
+            line_hint: None,
+        };
+
+        let p = Plan::build_match(
+            &r,
+            sample_selector(vec![]),
+            vec![edit],
+            &content_by_path,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let cert = p.certificate.expect("match plan carries a certificate");
+        assert_eq!(
+            cert.scope_files.get(&PathBuf::from("b.rs")),
+            Some(&crate::hash::bytes_hash(&selector_saw_b)),
+            "the cert must record what the SELECTOR read, not what is on disk now"
+        );
+        assert_ne!(
+            cert.scope_files.get(&PathBuf::from("b.rs")),
+            Some(&crate::hash::file_hash(&r.join("b.rs")).unwrap()),
+            "a fresh read at certificate time would hide the post-scan change"
+        );
+    }
+
+    /// The other half of "exclusively from the map": a scope file with no
+    /// entry is a refusal naming it, never a fallback read. Fail closed —
+    /// a certificate that silently sourced one hash from a second read is
+    /// exactly the race above.
+    #[test]
+    fn build_match_refuses_a_scope_file_missing_from_the_content_map() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().to_path_buf();
+        std::fs::create_dir_all(r.join(".vc")).unwrap();
+        std::fs::write(r.join("a.rs"), "fn one() {}\n").unwrap();
+        std::fs::write(r.join("b.rs"), "fn two() {}\n").unwrap();
+
+        let edit = ResolvedEdit {
+            path: PathBuf::from("a.rs"),
+            start: 3,
+            end: 6,
+            old_b64: base64e(b"one"),
+            new_b64: base64e(b"uno"),
+            line_hint: None,
+        };
+        // b.rs is in scope (rust, whole tree) but absent from the map.
+        let content_by_path: BTreeMap<PathBuf, Vec<u8>> =
+            [(PathBuf::from("a.rs"), b"fn one() {}\n".to_vec())]
+                .into_iter()
+                .collect();
+
+        let err = Plan::build_match(
+            &r,
+            sample_selector(vec![]),
+            vec![edit],
+            &content_by_path,
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(err.kind, crate::ErrorKind::Usage));
+        assert!(err.message.contains("b.rs"), "message: {}", err.message);
     }
 
     /// Same root-escape defense as `build`: an edit path escaping the root
@@ -855,6 +1158,7 @@ mod tests {
             end: 3,
             old_b64: base64e(b"one"),
             new_b64: base64e(b"ONE"),
+            line_hint: None,
         };
         let content_by_path: BTreeMap<PathBuf, Vec<u8>> =
             [(PathBuf::from("../escape.txt"), b"one\n".to_vec())]
@@ -895,6 +1199,7 @@ mod tests {
             end: 4,
             old_b64: base64e(b"abcd"),
             new_b64: base64e(b"1"),
+            line_hint: None,
         };
         let inner = ResolvedEdit {
             path: PathBuf::from("a.rs"),
@@ -902,6 +1207,7 @@ mod tests {
             end: 6,
             old_b64: base64e(b"cdef"),
             new_b64: base64e(b"2"),
+            line_hint: None,
         };
         let content_by_path: BTreeMap<PathBuf, Vec<u8>> =
             [(PathBuf::from("a.rs"), b"abcdef".to_vec())]
@@ -935,6 +1241,7 @@ mod tests {
             end: 18,
             old_b64: base64e(b"two"),
             new_b64: base64e(b"dos"),
+            line_hint: None,
         };
         let first = ResolvedEdit {
             path: PathBuf::from("a.rs"),
@@ -942,6 +1249,7 @@ mod tests {
             end: 6,
             old_b64: base64e(b"one"),
             new_b64: base64e(b"uno"),
+            line_hint: None,
         };
         let content_by_path: BTreeMap<PathBuf, Vec<u8>> = [(
             PathBuf::from("a.rs"),
@@ -984,6 +1292,7 @@ mod tests {
             end: 6,
             old_b64: base64e(b"one"),
             new_b64: base64e(b"uno"),
+            line_hint: None,
         };
         let content_by_path: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new(); // no entry for a.rs
 
@@ -1016,6 +1325,7 @@ mod tests {
             end: 6,
             old_b64: base64e(b"one"),
             new_b64: base64e(b"uno"),
+            line_hint: None,
         };
         let content_by_path: BTreeMap<PathBuf, Vec<u8>> =
             [(PathBuf::from("a.rs"), b"fn one() {}\n".to_vec())]
@@ -1059,6 +1369,7 @@ mod tests {
             end: 6,
             old_b64: base64e(b"one"),
             new_b64: base64e(b"uno"),
+            line_hint: None,
         };
         let content_by_path: BTreeMap<PathBuf, Vec<u8>> =
             [(PathBuf::from("a.rs"), b"fn one() {}\n".to_vec())]

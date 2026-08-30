@@ -39,10 +39,15 @@ use ast_grep_core::tree_sitter::{LanguageExt, StrDoc, TSLanguage};
 use ast_grep_core::{AstGrep, Language, Pattern, PatternError};
 use velocity_code_kernel::{ErrorKind, VcError, VcResult};
 
-/// Every file that produced at least one [`MatchSite`], keyed by its
-/// root-relative path, holding the exact bytes the spans were computed
-/// against. Same shape and same purpose as
-/// `velocity_code_kernel::resolve::ContentByPath`.
+/// Every file [`match_sites`] scanned — matched or not — keyed by its
+/// root-relative path, holding the exact bytes that scan read. Same shape
+/// and same purpose as `velocity_code_kernel::resolve::ContentByPath`.
+///
+/// The map covers the *whole scanned scope*, not just the files that
+/// produced sites, so a caller that must describe the scope it saw (the
+/// plan's provenance certificate) can hash these bytes instead of reading
+/// the tree a second time. See [`match_sites`] for the memory cost that
+/// buys.
 pub type ContentByPath = BTreeMap<PathBuf, Vec<u8>>;
 
 /// One resolved rewrite site: a byte range in one file's original buffer,
@@ -304,12 +309,26 @@ fn build_pattern(pattern: &str, rewrite: &str) -> VcResult<Pattern> {
 /// `(sites, content_by_path, warnings)`:
 ///
 /// * `sites` — sorted by `(path, start)`.
-/// * `content_by_path` — the exact bytes of every file that produced at
-///   least one site. Hash these, not a second read: the spans are offsets
-///   into precisely these buffers.
+/// * `content_by_path` — the exact bytes of **every scanned file**, not
+///   just the ones that produced a site. Hash these, not a second read:
+///   the spans are offsets into precisely these buffers, and a scope file
+///   that produced no site still has to be described by the bytes this
+///   scan saw rather than by whatever is on disk once the scan is over.
 /// * `warnings` — one line per file skipped without failing the run (not
 ///   UTF-8, or its parse tree contains an error). Callers must surface
-///   these; a silently skipped file is an incomplete refactor.
+///   these; a silently skipped file is an incomplete refactor. A skipped
+///   file's bytes are still returned in `content_by_path` — "we could not
+///   match it" is not "we did not read it".
+///
+/// **Memory cost.** Retaining every scanned buffer makes the whole scope
+/// resident for the life of the call: a scope of N bytes of source costs
+/// ~N bytes of heap here, where the previous match-only map cost roughly
+/// the size of the matched files alone. That is the price of the
+/// single-read discipline — the alternative (re-reading unmatched files
+/// later, for the certificate) is a plan-time TOCTOU: a file changed
+/// between the match pass and the certificate walk would be baselined
+/// *post-change* with no edit, and the apply-time scope-drift check,
+/// which compares against that baseline, would be blind to it.
 ///
 /// Refusals: `ErrorKind::Usage` for an unknown `lang`, a non-root-relative
 /// scope path, an unparseable pattern, or a rewrite naming an unbound
@@ -363,25 +382,27 @@ pub fn match_sites(
             _ => VcError::new(ErrorKind::Io, format!("{}: {e}", rel.display())),
         })?;
 
-        let Ok(src) = std::str::from_utf8(&bytes) else {
+        // The buffer is retained for EVERY scanned file, before any skip
+        // decision: a caller's certificate has to describe what this scan
+        // saw, and a file we could not match is still a file we read.
+        // Inserting here (rather than only on a hit) is what makes the
+        // scan the single read of the scope.
+        let bytes = content_by_path.entry(rel.clone()).or_insert(bytes);
+
+        let Ok(src) = std::str::from_utf8(bytes) else {
             warnings.push(format!("{}: skipped — not valid utf-8", rel.display()));
             continue;
         };
 
-        let found = match file_sites(rel, src, &pat, rewrite) {
-            Ok(Some(found)) => found,
+        match file_sites(rel, src, &pat, rewrite) {
+            Ok(Some(found)) => sites.extend(found),
             Ok(None) => {
                 warnings.push(format!(
                     "{}: skipped — source did not parse as rust",
                     rel.display()
                 ));
-                continue;
             }
             Err(e) => return Err(e),
-        };
-        if !found.is_empty() {
-            content_by_path.insert(rel.clone(), bytes);
-            sites.extend(found);
         }
     }
 
@@ -649,7 +670,13 @@ mod tests {
 
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].path, PathBuf::from("good.rs"));
-        assert!(!content.contains_key(&PathBuf::from("bad.rs")));
+        // Skipped for matching, still read — and still in the content map,
+        // because a caller's certificate must describe it from the bytes
+        // this scan saw rather than from a later, racy re-read.
+        assert_eq!(
+            content.get(&PathBuf::from("bad.rs")).map(|b| b.as_slice()),
+            Some(b"fn broken( { fetch_config(a) ]]]\n".as_slice())
+        );
         assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
         assert!(warnings[0].contains("bad.rs"), "warning: {}", warnings[0]);
         assert!(
@@ -664,7 +691,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("bin.rs"), [0xff, 0xfe, 0x00]).unwrap();
 
-        let (sites, _, warnings) = match_sites(
+        let (sites, content, warnings) = match_sites(
             d.path(),
             "fetch_config($$$A)",
             "load_config($$$A)",
@@ -674,6 +701,11 @@ mod tests {
         .unwrap();
 
         assert!(sites.is_empty());
+        assert_eq!(
+            content.get(&PathBuf::from("bin.rs")).map(|b| b.as_slice()),
+            Some([0xffu8, 0xfe, 0x00].as_slice()),
+            "a non-utf8 file is still read once and still returned"
+        );
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("utf-8"), "warning: {}", warnings[0]);
     }
@@ -1009,24 +1041,38 @@ mod tests {
         assert_eq!(sites.len(), 1);
     }
 
-    /// A file with no match contributes neither a site nor a content-map
-    /// entry — the map is proportional to the result, not to the scope.
+    /// The single-read property, stated as a map invariant: the content map
+    /// is proportional to the SCOPE, not to the result. A file that matched
+    /// nothing is still present, holding the exact bytes this scan read —
+    /// which is what lets `Plan::build_match` build a provenance certificate
+    /// over the whole scope without a second, racy read of the tree.
     #[test]
-    fn files_without_matches_are_absent_from_the_content_map() {
+    fn every_scanned_file_is_in_the_content_map_even_with_no_matches() {
         let d = tempfile::tempdir().unwrap();
-        write(d.path(), "a.rs", "fn main() { other() }\n");
+        write(d.path(), "a.rs", "fn main() { fetch_config(a) }\n");
+        write(d.path(), "b.rs", "fn main2() { other() }\n");
 
         let (sites, content, warnings) = match_sites(
             d.path(),
             "fetch_config($$$A)",
             "load_config($$$A)",
             "rust",
-            &scope(&["a.rs"]),
+            &scope(&["a.rs", "b.rs"]),
         )
         .unwrap();
-        assert!(sites.is_empty());
-        assert!(content.is_empty());
+
+        assert_eq!(sites.len(), 1, "only a.rs matches");
         assert!(warnings.is_empty());
+        assert_eq!(
+            content.keys().collect::<Vec<_>>(),
+            vec![&PathBuf::from("a.rs"), &PathBuf::from("b.rs")],
+            "both scanned files are in the map, not just the matched one"
+        );
+        assert_eq!(
+            content[&PathBuf::from("b.rs")],
+            b"fn main2() { other() }\n".to_vec(),
+            "the unmatched file's bytes are exactly what this scan read"
+        );
     }
 
     /// Applying every site's `new` at its span reproduces exactly what a
