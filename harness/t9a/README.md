@@ -100,6 +100,103 @@ M4 agent study lands, it supersedes this harness as the source of the
 headline T9 number; this harness keeps its value as a fast, deterministic
 regression check on the one property it isolates.
 
+## Protocol v2: the next mutation classes and arms — planned, not implemented
+
+This section is a pre-registration, not a description of `run.sh`. Nothing
+below is built; `run.sh` still runs the single append drift and the two
+arms described above. Every result produced so far is **protocol v1**.
+
+**Where today's drift sits.** The append-a-marker-line drift is the
+*coordinate-preserving, harmless* variant of class (a) below: the needle
+keeps its text and position, the file hash changes, and applying the edit
+anyway would in fact have been fine. It proves that `vc` notices whole-file
+change; it does not yet show a baseline making a *wrong* edit that a
+smarter guard would also miss. The classes below are chosen so that an
+occurrence-based guard (re-find the needle, check only the matched span)
+is separated from a whole-file hash kernel.
+
+**Mutation classes (each injected between plan and apply):**
+
+- **(a)** coordinate-preserving adjacent edit — the needle is untouched and
+  does not move. Two sub-variants, *harmful* and *harmless*, because
+  whether applying anyway is wrong is decided by the task oracle, not by
+  the class.
+- **(a′)** offset-shifting edit above the target with the match set intact
+  — the needle moves, its text and ordinal do not.
+- **(b)** same-file dependency change the planned edit relies on,
+  oracle-confirmed harmful, paired with a harmless control.
+- **(d)** needle-duplicating insertion ahead of the target — an identical
+  match is inserted before the target, so a guard that addresses matches
+  by `path:ordinal@hash(matched text)` resolves the old id to a *different*
+  occurrence and applies to the wrong site.
+
+Dropped before implementation: "move the file and recreate identical
+content at the old path". With path and content restored, an
+occurrence-based guard resolves normally, and a `vc` refusal would test
+file-identity semantics rather than the guard — it discriminates nothing.
+A plain rename without recreation stays only as a coverage check.
+
+**What "wrong apply" means under each protocol.** Protocol v1's
+`wrong_apply` is a *stale* apply — a write against content that changed
+after plan time, harmless or not (that is what `run.sh` scores today).
+Protocol v2 reports two numerators separately: `stale_apply` (same
+definition as v1) and `oracle_wrong_apply` (an applied edit the frozen task
+oracle judges incorrect). The `≤ 1% / ≥ 10%` design gate below is stated on
+`oracle_wrong_apply` over all assigned trials; refusals and final task
+success are reported beside it, never folded in.
+
+**Pre-registered prediction.** `vc` refuses every class by construction:
+any byte change to a named file changes its hash. For the occurrence-id
+checked arm the prediction holds only under frozen adapter invariants: that
+arm validates exactly path, ordinal and the hash of the matched bytes, so
+fixtures in (a), (a′) and (b) must preserve all three plus match
+eligibility, the dependency change in (b) must lie outside the validated
+span, and class (d) must redirect the selected old ordinal to another
+occurrence with identical validated bytes. Under those invariants the
+checked arm applies (a), (a′) and (b) and mis-applies (d). An unexpected
+refusal is reported and investigated against the frozen invariants and
+adapter contract, not silently reclassified.
+
+**Arms (eligibility frozen before the run, never after results):**
+naive str-replace (the current baseline) · a symbol-level writer with no
+revalidation (naive symbolic arm) · the same tool's occurrence-id
+two-phase writer (checked arm: dry-run → ids → apply-by-id, all-or-nothing
+on a stale id) · `git apply --3way` · context-verified patch · a
+preimage-hash-verifying atomic writer · `vc`. The rule that names "best
+baseline" for the `≥ 10%` side of the gate is fixed before any trial, and
+all arms stay eligible for it. Note what that implies: the hash baseline
+verifies each complete named-file preimage captured before injection, so
+on these mutation classes it is predicted to refuse exactly as `vc` does.
+The `≥ 10%` criterion is therefore falsifiable by construction — if the
+hash baseline is the best baseline, it fails, and that is a result to
+report, not a fixture to repair. What separates `vc` from that arm is
+outside these classes: the journal and crash-consistency guarantees, the
+certificate, and the checkpoint-recovery study.
+
+**Reporting.** Every class is reported in its own table with pairing
+preserved, **and** the pre-registered frozen mixture remains the primary
+T9 assessment — the `≤ 1% / ≥ 10%` gate is never evaluated on a
+post-hoc selection of classes. Class allocation, the paired
+exact-binomial analysis, α, power, multiplicity and the underpower floor
+are written down before execution. For scale: a zero-failure `≤ 1%`
+one-sided 95% bound alone needs at least 299 observations in the assessed
+population, so per-class tables are descriptive unless a class is
+separately powered.
+
+**Selection metrics** (once `apply` accepts a subset of edit groups):
+selected-group precision, required-group recall, exclusion precision,
+select-all frequency, final task success. Grouping is frozen before the
+run.
+
+**Interaction contract these classes assume.** `plan` returns occurrence
+records grouped into independent edit groups; `apply` takes group ids
+plus the plan token; an unknown or stale id applies nothing; and
+regardless of selection the full named-file hash kernel, the certificate
+and the journal run unchanged — selection never narrows the kernel.
+Id-less apply means every group of the plan under the same token,
+certificate, kernel and journal; `--expect N` stays a supplementary guard
+that never authorizes a write on its own.
+
 ## Running it
 
 ```bash
