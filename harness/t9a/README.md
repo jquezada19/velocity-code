@@ -100,7 +100,7 @@ M4 agent study lands, it supersedes this harness as the source of the
 headline T9 number; this harness keeps its value as a fast, deterministic
 regression check on the one property it isolates.
 
-## Protocol v2 (2026-09-07): the next mutation classes and arms — planned, not implemented
+## Protocol v2: the next mutation classes and arms — planned, not implemented
 
 This section is a pre-registration, not a description of `run.sh`. Nothing
 below is built; `run.sh` still runs the single append drift and the two
