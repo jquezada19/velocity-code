@@ -8,17 +8,24 @@ is a real gate — a non-zero exit fails the run.
 ## Per-run artifact (every CI run)
 
 The `ci` workflow captures each harness's stdout under `harness/out/` and
-uploads it together with the T9a `results-*.jsonl` as the run artifact
-`harness-outputs`, on failure as well as success. That is the evidence for a
-single run; it expires with the artifact retention window.
+uploads whatever is there together with any T9a `results-*.jsonl` as the run
+artifact `harness-outputs`, on failure as well as success. It holds the
+outputs of the harnesses that actually ran: `ci` stops at the first failing
+step, so a T9a failure leaves no R1 output, and a build or test failure
+leaves no harness output at all. It is the evidence for a single run and
+expires with the artifact retention window. The `metrics` workflow uploads
+its own captured outputs the same way (`metrics-harness-outputs`).
 
-## Per-commit history (pushes to `main`)
+## Per-run history (pushes to `main`)
 
-The `metrics` workflow re-runs the three harnesses on every push to `main`
-and appends **one JSON line per commit** to `history.jsonl` on the dedicated
-`metrics` branch — an orphan branch that holds nothing else, so `main`'s
-history stays free of bot commits and no `[skip ci]` tricks are needed. Read
-it with:
+The `metrics` workflow re-runs the three harnesses on each push to `main`
+and appends **one JSON line per completed run**, measuring that push's tip
+commit, to `history.jsonl` on the dedicated `metrics` branch. Two honest
+limits: a push that lands while another is already queued is superseded and
+not measured (GitHub keeps one pending run per concurrency group), and a
+manual re-run appends a second line for the same commit. The branch is an
+orphan that holds nothing else, so `main`'s history stays free of bot
+commits and no `[skip ci]` tricks are needed. Read it with:
 
 ```bash
 git fetch origin metrics

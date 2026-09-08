@@ -9,8 +9,10 @@ on:
 permissions:
   contents: write
 
-# Two pushes to main in quick succession must append in order, never race
-# on the metrics branch.
+# Serialises writers on the metrics branch. Contract, stated honestly: one
+# line per COMPLETED run, measuring the push tip ($GITHUB_SHA). GitHub keeps
+# at most one pending run per group, so a push superseded in the queue is
+# not measured, and a re-run appends a second line for the same commit.
 concurrency:
   group: metrics-history
   cancel-in-progress: false
@@ -33,12 +35,16 @@ jobs:
       # job is to RECORD the outcome, red or green. Exit codes are captured
       # per harness and the history step turns them into the line.
       - name: Run harnesses
+        # The runner's default shell is `bash -e`: a bare failing command
+        # would abort this step before the next harness or the append ran.
+        # Each status is captured with `|| rc=$?` so all three always run
+        # and their outputs reach the history step.
         run: |
           mkdir -p harness/out
           export PATH="$PWD/target/release:$PATH"
-          bash harness/t9a/run.sh 100 > harness/out/t9a.txt 2>&1; echo "t9a exit=$?"
-          bash harness/r/r1_lexical.sh > harness/out/r1_lexical.txt 2>&1; echo "r1_lexical exit=$?"
-          bash harness/r/r1_defs.sh > harness/out/r1_defs.txt 2>&1; echo "r1_defs exit=$?"
+          rc=0; bash harness/t9a/run.sh 100 > harness/out/t9a.txt 2>&1 || rc=$?; echo "t9a exit=$rc"
+          rc=0; bash harness/r/r1_lexical.sh > harness/out/r1_lexical.txt 2>&1 || rc=$?; echo "r1_lexical exit=$rc"
+          rc=0; bash harness/r/r1_defs.sh > harness/out/r1_defs.txt 2>&1 || rc=$?; echo "r1_defs exit=$rc"
       - name: Append history line
         id: history
         continue-on-error: true
@@ -47,12 +53,19 @@ jobs:
           T9A=$(ls -t harness/t9a/results-*.jsonl 2>/dev/null | head -n 1 || true)
           # First run ever: no `metrics` branch yet, so start an orphan one
           # in a worktree. Every later run fetches it and appends.
-          if git fetch origin metrics; then
+          # ls-remote separates "branch absent" (exit 2) from a transport or
+          # auth error (anything else): only a confirmed absence starts the
+          # orphan branch; an error fails the step rather than forking history.
+          rc=0; git ls-remote --exit-code --heads origin metrics >/dev/null || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            git fetch origin metrics
             git worktree add -q .metrics FETCH_HEAD
-          else
+          elif [ "$rc" -eq 2 ]; then
             git worktree add -q --detach .metrics
             git -C .metrics checkout -q --orphan metrics
             git -C .metrics rm -rfq .
+          else
+            echo "ls-remote failed with $rc; not initialising an orphan branch over a possibly existing one"; exit "$rc"
           fi
           python3 harness/history.py \
             --t9a "${T9A:-/nonexistent}" \
@@ -67,8 +80,20 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add history.jsonl
-          git commit -q -m "history: ${GITHUB_SHA::7}" || { echo "nothing to commit"; exit 0; }
+          # An empty staged diff is the one benign reason not to commit; any
+          # other commit failure is real and fails the step.
+          if git diff --cached --quiet; then echo "nothing to commit"; exit 0; fi
+          git commit -q -m "history: ${GITHUB_SHA::7}"
           git push origin HEAD:metrics
+      # The captured outputs are the diagnostics the failure message points
+      # at, so they are uploaded whatever happened above.
+      - name: Upload harness outputs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: metrics-harness-outputs
+          path: harness/out/
+          if-no-files-found: warn
       # Go red only after the line is safely pushed, so a failing gate is
       # both recorded and visible.
       - name: Fail if any harness did not pass

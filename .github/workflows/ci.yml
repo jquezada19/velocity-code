@@ -48,7 +48,7 @@ jobs:
       - name: T9a stale-write gate
         run: |
           set -o pipefail
-          PATH="$PWD/target/release:$PATH" bash harness/t9a/run.sh 100 2>&1 | tee harness/out/t9a.txt
+          bash harness/t9a/run.sh 100 2>&1 | tee harness/out/t9a.txt  # run.sh resolves target/release/vc itself
       - name: R1 lexical parity
         run: |
           set -o pipefail

@@ -47,7 +47,11 @@ def parse_t9a(text):
         n = int(s["n"])
         vc = {k: int(v) for k, v in s["vc"].items()}
         base = {k: int(v) for k, v in s["base"].items()}
-        gate = bool(s["gate_pass"])
+        gate = s["gate_pass"]
+        # The producer emits a real JSON boolean and these counters; a string
+        # "false" or an empty counter object is malformed, not a pass.
+        if not isinstance(gate, bool) or "wrong_apply" not in vc or "refused" not in vc or "wrong_apply" not in base:
+            raise ValueError("gate_pass must be a boolean and vc/base must carry wrong_apply/refused")
     except (ValueError, KeyError, TypeError, AttributeError) as e:
         return {"parsed": False, "pass": False, "error": f"summary line: {e}"}
     return {"parsed": True, "pass": gate, "n": n, "vc": vc, "base": base}
@@ -71,8 +75,8 @@ def parse_r1_lexical(text):
 
 
 _DEFS = re.compile(
-    r"^R1 definitions: top-1 (\d+)/(\d+) \(([\d.]+)%\), negative controls (\d+)/(\d+), "
-    r"confidently-wrong (\d+)/(\d+) \(([\d.]+)%\)"
+    r"^R1 definitions: top-1 (\d+)/(\d+) \((\d+(?:\.\d+)?)%\), negative controls (\d+)/(\d+), "
+    r"confidently-wrong (\d+)/(\d+) \((\d+(?:\.\d+)?)%\)"
 )
 _DEFS_VERDICT = re.compile(r"^R1 definitions: (PASS|FAIL)")
 
@@ -86,21 +90,28 @@ def parse_r1_defs(text):
         s = ln.strip()
         m = _DEFS.match(s)
         if m:
-            stats = {
-                "top1": int(m.group(1)),
-                "n_pos": int(m.group(2)),
-                "top1_pct": float(m.group(3)),
-                "neg_correct": int(m.group(4)),
-                "n_neg": int(m.group(5)),
-                "confidently_wrong": int(m.group(6)),
-                "wrong_pct": float(m.group(8)),
-            }
+            try:
+                stats = _defs_stats(m)
+            except ValueError as e:
+                return {"parsed": False, "pass": False, "error": f"stats line: {e}"}
         v = _DEFS_VERDICT.match(s)
         if v:
             verdict = v.group(1)
     if stats is None or verdict is None:
         return {"parsed": False, "pass": False, "error": "stats or verdict line missing"}
     return {"parsed": True, "pass": verdict == "PASS", **stats}
+
+
+def _defs_stats(m):
+    return {
+        "top1": int(m.group(1)),
+        "n_pos": int(m.group(2)),
+        "top1_pct": float(m.group(3)),
+        "neg_correct": int(m.group(4)),
+        "n_neg": int(m.group(5)),
+        "confidently_wrong": int(m.group(6)),
+        "wrong_pct": float(m.group(8)),
+    }
 
 
 def main(argv):
