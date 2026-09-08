@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -77,8 +79,9 @@ class Main(unittest.TestCase):
         lex_bad = tmp("no verdict here\n")
         defs = tmp(R1Defs.STATS + "R1 definitions: PASS\n")
         out = tmp("")
-        self.assertEqual(history.main(["--t9a", t9a, "--r1-lexical", lex_ok, "--r1-defs", defs, "--commit", "abc", "--out", out]), 0)
-        self.assertEqual(history.main(["--t9a", t9a, "--r1-lexical", lex_bad, "--r1-defs", defs, "--commit", "abc", "--out", out]), 1)
+        with contextlib.redirect_stdout(io.StringIO()):  # main prints the line; keep the test output clean
+            self.assertEqual(history.main(["--t9a", t9a, "--r1-lexical", lex_ok, "--r1-defs", defs, "--commit", "abc", "--out", out]), 0)
+            self.assertEqual(history.main(["--t9a", t9a, "--r1-lexical", lex_bad, "--r1-defs", defs, "--commit", "abc", "--out", out]), 1)
         lines = [json.loads(l) for l in open(out)]
         self.assertEqual([l["all_pass"] for l in lines], [True, False])
         self.assertFalse(lines[1]["r1_lexical"]["parsed"])
