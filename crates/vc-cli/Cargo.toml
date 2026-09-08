@@ -24,6 +24,7 @@ velocity-code-lang = { path = "../vc-lang" }
 [dev-dependencies]
 tempfile.workspace = true
 assert_cmd.workspace = true
+predicates = "3"
 
 # Gated separately from the auto-discovered `tests/*.rs` targets: this
 # suite spawns the real `vc` binary and relies on VC_FAULT_POINT actually
