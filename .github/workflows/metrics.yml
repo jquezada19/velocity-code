@@ -1,0 +1,103 @@
+name: metrics
+# One JSON line per commit on main, appended to history.jsonl on the
+# dedicated `metrics` branch (see harness/README.md). This workflow is the
+# only one that writes to the repo, and it says so here instead of
+# inheriting a write token: `ci` stays read-only.
+on:
+  push: { branches: [main] }
+
+permissions:
+  contents: write
+
+# Serialises writers on the metrics branch. Contract, stated honestly: one
+# line per COMPLETED run, measuring the push tip ($GITHUB_SHA). GitHub keeps
+# at most one pending run per group, so a push superseded in the queue is
+# not measured, and a re-run appends a second line for the same commit.
+concurrency:
+  group: metrics-history
+  cancel-in-progress: false
+
+jobs:
+  history:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      - run: sudo apt-get update && sudo apt-get install -y ripgrep jq
+      - run: cargo build --release
+      # yagni: this re-runs what `ci` just ran on the same commit (~2 min);
+      # switch to a workflow_run trigger + artifact download only if the
+      # harness suite grows past ~10 min. The duplication buys a job that
+      # is self-contained and the only one holding a write token.
+      # Run all three harnesses and keep going on failure: the point of this
+      # job is to RECORD the outcome, red or green. Exit codes are captured
+      # per harness and the history step turns them into the line.
+      - name: Run harnesses
+        # The runner's default shell is `bash -e`: a bare failing command
+        # would abort this step before the next harness or the append ran.
+        # Each status is captured with `|| rc=$?` so all three always run
+        # and their outputs reach the history step.
+        run: |
+          mkdir -p harness/out
+          export PATH="$PWD/target/release:$PATH"
+          rc=0; bash harness/t9a/run.sh 100 > harness/out/t9a.txt 2>&1 || rc=$?; echo "t9a exit=$rc"
+          rc=0; bash harness/r/r1_lexical.sh > harness/out/r1_lexical.txt 2>&1 || rc=$?; echo "r1_lexical exit=$rc"
+          rc=0; bash harness/r/r1_defs.sh > harness/out/r1_defs.txt 2>&1 || rc=$?; echo "r1_defs exit=$rc"
+      - name: Append history line
+        id: history
+        continue-on-error: true
+        run: |
+          set -e
+          T9A=$(ls -t harness/t9a/results-*.jsonl 2>/dev/null | head -n 1 || true)
+          # First run ever: no `metrics` branch yet, so start an orphan one
+          # in a worktree. Every later run fetches it and appends.
+          # ls-remote separates "branch absent" (exit 2) from a transport or
+          # auth error (anything else): only a confirmed absence starts the
+          # orphan branch; an error fails the step rather than forking history.
+          rc=0; git ls-remote --exit-code --heads origin metrics >/dev/null || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            git fetch origin metrics
+            git worktree add -q .metrics FETCH_HEAD
+          elif [ "$rc" -eq 2 ]; then
+            git worktree add -q --detach .metrics
+            git -C .metrics checkout -q --orphan metrics
+            git -C .metrics rm -rfq .
+          else
+            echo "ls-remote failed with $rc; not initialising an orphan branch over a possibly existing one"; exit "$rc"
+          fi
+          python3 harness/history.py \
+            --t9a "${T9A:-/nonexistent}" \
+            --r1-lexical harness/out/r1_lexical.txt \
+            --r1-defs harness/out/r1_defs.txt \
+            --commit "$GITHUB_SHA" \
+            --run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --out .metrics/history.jsonl
+      - name: Commit and push history
+        run: |
+          cd .metrics
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add history.jsonl
+          # An empty staged diff is the one benign reason not to commit; any
+          # other commit failure is real and fails the step.
+          if git diff --cached --quiet; then echo "nothing to commit"; exit 0; fi
+          git commit -q -m "history: ${GITHUB_SHA::7}"
+          git push origin HEAD:metrics
+      # The captured outputs are the diagnostics the failure message points
+      # at, so they are uploaded whatever happened above.
+      - name: Upload harness outputs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: metrics-harness-outputs
+          path: harness/out/
+          if-no-files-found: warn
+      # Go red only after the line is safely pushed, so a failing gate is
+      # both recorded and visible.
+      - name: Fail if any harness did not pass
+        if: steps.history.outcome != 'success'
+        run: |
+          echo "a harness failed or its output did not parse — see harness/out and the appended line"
+          exit 1
