@@ -56,9 +56,15 @@ beyond two sigma on one side), `run8` (eight on one side of centre), `mr` (a mov
 are not computed below 4 points and are labelled provisional below 8. A
 count is floored at 0 and a percentage capped at 100 for display only; the
 two-sigma zone comes from the unclamped limits, so a clamp never tightens
-detection. A metric that has never moved has zero-width limits, so its first
-change is a `rule1` signal by construction — the intended reading for gates
-expected to sit at 0 or N.
+detection. Limits are recomputed over the whole stream each run, so a signal is a
+retrospective reading: a change after a long flat history is flagged (the
+flat history keeps mR̄ near zero), a change after a short one may not be,
+and a later larger move can absorb an earlier signal. Gaps (a run whose
+harness did not parse, or whose record lacks the metric) contribute no
+value and break adjacency: moving ranges are taken only between consecutive
+runs and the windowed rules never span a gap. A value outside the metric's
+domain or not a finite number is malformed data: the report refuses, names
+the record, and fails the step.
 
 Both tools have unit tests (`harness/test_*.py`), run by `ci` before the
 build.

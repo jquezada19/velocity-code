@@ -34,16 +34,29 @@ Signals, each named on the point that completes it:
 Sample size: below MIN_POINTS no limits are computed (the values are listed
 as-is); from MIN_POINTS up to PROVISIONAL_BELOW the limits are printed but
 labelled provisional; from PROVISIONAL_BELOW they are read as the process
-voice. A stream with mR̄ = 0 (a metric that has never moved) has limits
-equal to its centre, so its first change is a rule1 signal by construction —
-that is the intended reading for gates that are expected to stay at 0 or N.
+voice. Limits are recomputed over the whole stream on every run, so a signal
+is a retrospective reading of the stream as it stands, not a frozen verdict:
+a change after a long flat run is flagged (the flat history keeps mR̄ near
+zero), a change after a short one may not be, and a later, larger move can
+absorb an earlier signal. A fixed-baseline policy would freeze limits; it is
+not implemented.
 
-Lines whose harness did not parse contribute no value to that harness's
-metrics (a gap, listed in the section) — a malformed observation must never
-move the centre line for every other run's verdict.
+Rule 1 reads the clamped limits: a valid value can never lie beyond a clamp,
+so on valid data the clamped and unclamped readings agree, and the clamp
+only removes a limit the data could never test. Values outside the metric's
+domain (a negative count, a percentage above 100), non-finite numbers,
+booleans and non-numbers are malformed data, not observations — the report
+refuses with the offending record named, and exits non-zero.
+
+Runs whose harness did not parse, or whose record lacks the metric, are
+gaps: they contribute no value and they break adjacency. Moving ranges are
+taken only between runs that are consecutive in the stream, and the
+windowed rules (rule2, run8) never span a gap — a missing run must neither
+move the centre line nor manufacture a neighbour.
 """
 import argparse
 import json
+import math
 import sys
 
 MIN_POINTS = 4
@@ -81,33 +94,56 @@ def load_history(path):
     return records
 
 
-def series_for(records, harness, path):
-    """(points, gaps): points = [(short_commit, value)], gaps = short commits skipped."""
+def series_for(records, harness, path, lower=None, upper=None):
+    """(points, gaps): points = [(position, short_commit, value)] in stream order,
+    gaps = short commits with no usable value. Raises ValueError on a value that
+    is present but not a finite number inside the metric's domain."""
     points, gaps = [], []
-    for rec in records:
+    for pos, rec in enumerate(records):
         short = str(rec.get("commit", ""))[:7]
         h = rec.get(harness)
         if not isinstance(h, dict) or not h.get("parsed"):
             gaps.append(short)
             continue
         node = h
-        try:
-            for key in path:
-                node = node[key]
-            value = float(node)
-        except (KeyError, TypeError, ValueError):
+        missing = False
+        for key in path:
+            if not isinstance(node, dict) or key not in node:
+                missing = True
+                break
+            node = node[key]
+        if missing:
             gaps.append(short)
             continue
-        points.append((short, value))
+        label = f"{harness}.{'.'.join(path)}"
+        if isinstance(node, bool) or not isinstance(node, (int, float)):
+            raise ValueError(f"record {pos + 1} ({short}): {label} is not a number: {node!r}")
+        value = float(node)
+        if math.isnan(value) or math.isinf(value):
+            raise ValueError(f"record {pos + 1} ({short}): {label} is not finite: {node!r}")
+        if (lower is not None and value < lower) or (upper is not None and value > upper):
+            raise ValueError(f"record {pos + 1} ({short}): {label} = {node!r} is outside [{lower}, {upper}]")
+        points.append((pos, short, value))
     return points, gaps
 
 
-def limits(values, lower=None, upper=None):
-    """Centre, mR̄, unclamped (lnpl, unpl), clamped (lnpl, unpl), mR upper limit."""
+def moving_ranges(values, positions):
+    """|x[i] - x[i-1]| for pairs that are consecutive in the stream; None where a gap sits between."""
+    out = []
+    for i in range(1, len(values)):
+        out.append(abs(values[i] - values[i - 1]) if positions[i] == positions[i - 1] + 1 else None)
+    return out
+
+
+def limits(values, positions, lower=None, upper=None):
+    """Centre, mR̄, unclamped (lnpl, unpl), clamped (lnpl, unpl), mR upper limit.
+    Returns None when no two runs are consecutive (mR̄ undefined)."""
     n = len(values)
     centre = sum(values) / n
-    mrs = [abs(values[i] - values[i - 1]) for i in range(1, n)]
-    mr_bar = sum(mrs) / len(mrs) if mrs else 0.0
+    mrs = [m for m in moving_ranges(values, positions) if m is not None]
+    if not mrs:
+        return None
+    mr_bar = sum(mrs) / len(mrs)
     lnpl = centre - XMR_LIMIT * mr_bar
     unpl = centre + XMR_LIMIT * mr_bar
     c_lnpl = max(lnpl, lower) if lower is not None else lnpl
@@ -115,26 +151,36 @@ def limits(values, lower=None, upper=None):
     return centre, mr_bar, (lnpl, unpl), (c_lnpl, c_unpl), MR_LIMIT * mr_bar
 
 
-def signals(values, centre, unclamped, clamped, mr_ul=None):
+def _contiguous(positions, i, width):
+    """True when the `width` points ending at i are consecutive runs in the stream."""
+    return i - width + 1 >= 0 and positions[i] - positions[i - width + 1] == width - 1
+
+
+def signals(values, positions, centre, unclamped, clamped, mr_ul):
     """List of (index, rule) — index is the point that completes the signal."""
     out = []
     lnpl, unpl = unclamped
-    if mr_ul is not None and mr_ul > 0:
-        for i in range(1, len(values)):
-            if abs(values[i] - values[i - 1]) > mr_ul:
-                out.append((i, "mr"))
     c_lnpl, c_unpl = clamped
     sigma = (unpl - centre) / 3.0  # one sigma-equivalent from mR̄
     hi2, lo2 = centre + 2 * sigma, centre - 2 * sigma
+    mrs = moving_ranges(values, positions)
     for i, v in enumerate(values):
         if v > c_unpl or v < c_lnpl:
             out.append((i, "rule1"))
+    if mr_ul > 0:
+        for i, m in enumerate(mrs, start=1):
+            if m is not None and m > mr_ul:
+                out.append((i, "mr"))
     if sigma > 0:
         for i in range(2, len(values)):
+            if not _contiguous(positions, i, 3):
+                continue
             window = values[i - 2 : i + 1]
             if sum(1 for v in window if v > hi2) >= 2 or sum(1 for v in window if v < lo2) >= 2:
                 out.append((i, "rule2"))
     for i in range(7, len(values)):
+        if not _contiguous(positions, i, 8):
+            continue
         window = values[i - 7 : i + 1]
         if all(v > centre for v in window) or all(v < centre for v in window):
             out.append((i, "run8"))
@@ -145,30 +191,37 @@ def fmt(x):
     return f"{x:.2f}".rstrip("0").rstrip(".") if isinstance(x, float) else str(x)
 
 
-def render_metric(label, points, gaps, lower, upper):
+def render_metric(label, points, gaps):
     lines = [f"### {label}", ""]
     n = len(points)
     if gaps:
-        lines.append(f"- gaps (harness not parsed): {', '.join(gaps)}")
+        lines.append(f"- gaps (harness not parsed, or metric absent): {', '.join(gaps)}")
     if n == 0:
         lines += ["- no parsed values yet", ""]
         return lines
-    values = [v for _, v in points]
-    lines.append(f"- n = {n}; last = {fmt(values[-1])} @ {points[-1][0]}")
+    positions = [p for p, _, _ in points]
+    values = [v for _, _, v in points]
+    lines.append(f"- n = {n}; last = {fmt(values[-1])} @ {points[-1][1]}")
     if n < MIN_POINTS:
         lines.append(f"- values: {', '.join(fmt(v) for v in values)}")
         lines.append(f"- limits: not computed (n < {MIN_POINTS})")
         lines.append("")
         return lines
-    centre, mr_bar, unclamped, clamped, mr_ul = limits(values, lower, upper)
+    lim = limits(values, positions, *_clamps_for(label))
+    if lim is None:
+        lines.append(f"- values: {', '.join(fmt(v) for v in values)}")
+        lines.append("- limits: not computed (no two consecutive runs; mR̄ undefined)")
+        lines.append("")
+        return lines
+    centre, mr_bar, unclamped, clamped, mr_ul = lim
     tag = " (provisional)" if n < PROVISIONAL_BELOW else ""
     lines.append(f"- centre = {fmt(centre)}; mR̄ = {fmt(mr_bar)}; limits{tag} = [{fmt(clamped[0])}, {fmt(clamped[1])}]; mR upper = {fmt(mr_ul)}")
     if mr_bar == 0:
-        lines.append("- mR̄ is 0: the metric has never moved, so its first change will be a rule1 signal")
-    sig = signals(values, centre, unclamped, clamped, mr_ul)
+        lines.append("- mR̄ is 0 so far: the limits have no width, and the next change will read as rule1 (limits are recomputed each run)")
+    sig = signals(values, positions, centre, unclamped, clamped, mr_ul)
     if sig:
         for i, rule in sig:
-            lines.append(f"- signal {rule} at {points[i][0]} (value {fmt(values[i])})")
+            lines.append(f"- signal {rule} at {points[i][1]} (value {fmt(values[i])})")
     else:
         lines.append("- no signals")
     lines.append(f"- values: {', '.join(fmt(v) for v in values)}")
@@ -176,12 +229,19 @@ def render_metric(label, points, gaps, lower, upper):
     return lines
 
 
+def _clamps_for(label):
+    for lab, _h, _p, lower, upper in METRICS:
+        if lab == label:
+            return lower, upper
+    return None, None
+
+
 def render(records):
     lines = ["# Harness history — process-behaviour report", "",
              f"{len(records)} run(s). Limits = centre ± {XMR_LIMIT}·mR̄; provisional below n = {PROVISIONAL_BELOW}, not computed below n = {MIN_POINTS}. React to signals, not to neighbouring deltas.", ""]
     for label, harness, path, lower, upper in METRICS:
-        points, gaps = series_for(records, harness, path)
-        lines += render_metric(label, points, gaps, lower, upper)
+        points, gaps = series_for(records, harness, path, lower, upper)
+        lines += render_metric(label, points, gaps)
     return "\n".join(lines)
 
 
@@ -191,10 +251,11 @@ def main(argv):
     a = ap.parse_args(argv)
     try:
         records = load_history(a.history)
+        report = render(records)
     except (OSError, ValueError) as e:
         print(f"xmr: {e}", file=sys.stderr)
         return 1
-    print(render(records))
+    print(report)
     return 0
 
 
