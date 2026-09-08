@@ -45,6 +45,33 @@ A harness whose output could not be parsed is recorded as
 `"parsed": false, "pass": false` — a broken gate leaves a mark, never a gap —
 and the `metrics` run goes red after the line is appended.
 
+## Reading the stream: `REPORT.md`
+
+`harness/xmr.py` renders `history.jsonl` as a process-behaviour report,
+regenerated on the `metrics` branch by every run (`git show
+origin/metrics:REPORT.md`). Per metric: the values in run order, the centre
+line, the natural process limits (centre ± 2.66·mR̄, never the global SD),
+and any signals — `rule1` (a point beyond a limit), `rule2` (two of three
+beyond two sigma on one side), `run8` (eight on one side of centre), `mr` (a moving range beyond 3.268·mR̄). Limits
+are not computed below 4 points and are labelled provisional below 8. A
+count is floored at 0 and a percentage capped at 100 for display only; the
+two-sigma zone comes from the unclamped limits, so a clamp never tightens
+detection. Limits are recomputed over the whole stream each run, so a signal is a
+retrospective reading: a change after a long flat history is flagged (the
+flat history keeps mR̄ near zero), a change after a short one may not be,
+and a later larger move can absorb an earlier signal. Gaps (a run whose
+harness did not parse, or whose record lacks the metric) contribute no
+value and break adjacency: moving ranges are taken only between consecutive
+runs and the windowed rules never span a gap. A value that is present but malformed — outside
+the metric's domain, a fractional count, not a finite number, a non-boolean
+`parsed`, a container that is not an object — is data, not an observation:
+the report refuses, names the record, and the `metrics` step fails **after**
+the history line has been committed and pushed, so a bad report never costs
+a run its record.
+
+Both tools have unit tests (`harness/test_*.py`), run by `ci` before the
+build.
+
 ## Rules
 
 - `history.jsonl` is generated. Never hand-edit it; a bad line is fixed by

@@ -33,6 +33,9 @@ jobs:
       - run: cargo test --workspace
       - run: cargo test -p velocity-code-cli --features fault-injection --test crash_consistency
       - run: sudo apt-get update && sudo apt-get install -y ripgrep jq
+      # The harness tooling (history parser, XmR report) is stdlib Python
+      # with its own unit tests; they gate like everything else.
+      - run: python3 -m unittest discover -s harness -p 'test_*.py'
       - run: cargo build --release
       # Invoked via `bash <script>` rather than as an executable: the gate
       # then runs whatever is in the file regardless of whether the
