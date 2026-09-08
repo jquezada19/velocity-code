@@ -3,3 +3,4 @@
 .superpowers/
 harness/t9a/results-*.jsonl
 harness/out/
+__pycache__/
