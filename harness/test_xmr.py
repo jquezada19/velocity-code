@@ -56,6 +56,15 @@ class Limits(unittest.TestCase):
     def test_no_consecutive_runs_means_no_limits(self):
         self.assertIsNone(xmr.limits([1, 2, 3, 4], [0, 2, 4, 6]))
 
+    def test_gap_is_not_in_the_moving_range_denominator(self):
+        # ranges 2 and 4 with a gap between: mR̄ = 3, not 6/3 = 2
+        centre, mr_bar, *_ = xmr.limits([0, 2, 5, 9], [0, 1, 3, 4])
+        self.assertAlmostEqual(mr_bar, 3.0)
+
+    def test_overflowing_values_refuse_instead_of_infinite_limits(self):
+        with self.assertRaises(ValueError):
+            xmr.limits([1e308] * 4, seq(4))
+
 
 class Signals(unittest.TestCase):
     def sig(self, values, positions=None, lower=None, upper=None):
@@ -132,6 +141,42 @@ class Signals(unittest.TestCase):
         values = [10.0, 10.5, 10.0, 10.5, 10.0, 10.5, 10.0, 10.5, 10.0, 10.5, 13.0, 12.6]
         self.assertIn((10, "mr"), self.sig(values))
 
+    def test_rule2_window_never_spans_a_gap(self):
+        base = [10.0, 11.0] * 5
+        values = base + [14.5, 10.5, 14.5]
+        positions = seq(11) + [12, 13]          # a missing run between the two highs
+        rules = self.sig(values, positions)
+        self.assertNotIn((12, "rule2"), rules)
+        self.assertIn((12, "rule2"), self.sig(values))  # same stream contiguous does fire
+
+    def test_mr_signal_after_an_earlier_gap_has_the_point_index(self):
+        values = [10.0, 10.5, 10.0, 10.5, 10.0, 10.5, 10.0, 10.5, 10.0, 10.5, 13.0, 12.6]
+        positions = [0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]  # gap after the second run
+        rules = self.sig(values, positions)
+        self.assertIn((10, "mr"), rules)          # index into the points list, not the stream position 11
+        self.assertNotIn((11, "mr"), rules)
+
+    def test_sigma_comes_from_the_unclamped_upper_limit(self):
+        # percentages hugging the 100 cap: the clamped upper limit is 100, the
+        # unclamped one is above it; a sigma taken from the clamped width would
+        # put every 100 beyond two sigma and fire rule2 on an ordinary stream
+        values = [100.0, 98.0] * 5
+        centre, _, unc, cl, mr_ul = xmr.limits(values, seq(10), 0.0, 100.0)
+        self.assertEqual(cl[1], 100.0)
+        self.assertGreater(unc[1], 100.0)
+        self.assertEqual([r for _, r in xmr.signals(values, seq(10), centre, unc, cl, mr_ul) if r == "rule2"], [])
+
+    def test_rule2_still_evaluated_when_sigma_is_zero(self):
+        # two plateaus separated by a gap: mR̄ = 0, centre 5; each plateau is a
+        # contiguous window entirely on one side, so rule2 fires alongside rule1
+        values = [0.0] * 4 + [10.0] * 4
+        positions = [0, 1, 2, 3, 5, 6, 7, 8]
+        rules = self.sig(values, positions)
+        self.assertIn((7, "rule2"), rules)
+        self.assertIn((7, "rule1"), rules)
+        # a constant series never fires rule2
+        self.assertEqual([r for _, r in self.sig([5.0] * 8) if r == "rule2"], [])
+
     def test_mr_signal_not_across_a_gap(self):
         values = [10.0, 10.5, 10.0, 10.5, 10.0, 10.5, 10.0, 10.5, 10.0, 10.5, 13.0, 12.6]
         positions = seq(10) + [11, 12]         # the jump 10.5→13.0 straddles a gap
@@ -162,14 +207,33 @@ class Series(unittest.TestCase):
                 xmr.series_for([r], "r1_lexical", ("mismatches",))
 
     def test_out_of_domain_is_malformed(self):
-        r = rec("a1", mism=-1)
         with self.assertRaises(ValueError):
-            xmr.series_for([r], "r1_lexical", ("mismatches",), lower=0.0)
-        r = rec("a1", top1=101.0)
+            xmr.series_for([rec("a1", mism=-1)], "r1_lexical", ("mismatches",), "count")
         with self.assertRaises(ValueError):
-            xmr.series_for([r], "r1_defs", ("top1_pct",), lower=0.0, upper=100.0)
-        # the boundary itself is valid
-        xmr.series_for([rec("a1", top1=100.0), rec("a2", mism=0)], "r1_defs", ("top1_pct",), lower=0.0, upper=100.0)
+            xmr.series_for([rec("a1", top1=101.0)], "r1_defs", ("top1_pct",), "pct")
+        # the boundaries themselves are valid
+        xmr.series_for([rec("a1", top1=100.0), rec("a2", top1=0.0)], "r1_defs", ("top1_pct",), "pct")
+
+    def test_fractional_count_is_malformed_but_fractional_pct_is_fine(self):
+        with self.assertRaises(ValueError):
+            xmr.series_for([rec("a1", mism=0.5)], "r1_lexical", ("mismatches",), "count")
+        xmr.series_for([rec("a1", top1=99.5)], "r1_defs", ("top1_pct",), "pct")
+
+    def test_string_parsed_and_malformed_container_are_rejected(self):
+        r = rec("a1"); r["r1_lexical"]["parsed"] = "false"
+        with self.assertRaises(ValueError):
+            xmr.series_for([r], "r1_lexical", ("mismatches",), "count")
+        r = rec("a1"); r["t9a"]["vc"] = False
+        with self.assertRaises(ValueError):
+            xmr.series_for([r], "t9a", ("vc", "wrong_apply"), "count")
+        r = rec("a1"); r["t9a"] = "nope"
+        with self.assertRaises(ValueError):
+            xmr.series_for([r], "t9a", ("vc", "wrong_apply"), "count")
+
+    def test_absent_harness_key_is_a_gap(self):
+        r = rec("a1"); del r["t9a"]
+        points, gaps = xmr.series_for([r, rec("a2")], "t9a", ("vc", "wrong_apply"), "count")
+        self.assertEqual((len(points), gaps), (1, ["a1"]))
 
 
 class Render(unittest.TestCase):
@@ -194,7 +258,8 @@ class Render(unittest.TestCase):
     def test_eight_points_are_not_provisional(self):
         out = xmr.render(xmr.load_history(self._write([rec(f"c{i}") for i in range(8)])))
         self.assertNotIn("(provisional)", out)
-        self.assertIn("mR̄ is 0 so far", out)
+        self.assertIn("a later change may read as rule1", out)
+        self.assertNotIn("will read as rule1", out)
 
     def test_short_flat_history_does_not_flag_the_first_change(self):
         # [0,0,0,1]: the 1 enters mR̄ and widens the limits — documented, and pinned
@@ -205,6 +270,15 @@ class Render(unittest.TestCase):
         path = self._write([rec("a1")], extra_line="{not json")
         with self.assertRaises(ValueError):
             xmr.load_history(path)
+        self.assertEqual(xmr.main([path]), 1)
+
+    def test_string_parsed_fails_the_report(self):
+        r = rec("a1"); r["t9a"]["parsed"] = "false"
+        path = self._write([r] + [rec(f"c{i}") for i in range(7)])
+        self.assertEqual(xmr.main([path]), 1)
+
+    def test_fractional_count_fails_the_report(self):
+        path = self._write([rec("a1", mism=0.5)] + [rec(f"c{i}") for i in range(7)])
         self.assertEqual(xmr.main([path]), 1)
 
     def test_non_finite_value_fails_the_report(self):

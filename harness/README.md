@@ -62,9 +62,12 @@ flat history keeps mR̄ near zero), a change after a short one may not be,
 and a later larger move can absorb an earlier signal. Gaps (a run whose
 harness did not parse, or whose record lacks the metric) contribute no
 value and break adjacency: moving ranges are taken only between consecutive
-runs and the windowed rules never span a gap. A value outside the metric's
-domain or not a finite number is malformed data: the report refuses, names
-the record, and fails the step.
+runs and the windowed rules never span a gap. A value that is present but malformed — outside
+the metric's domain, a fractional count, not a finite number, a non-boolean
+`parsed`, a container that is not an object — is data, not an observation:
+the report refuses, names the record, and the `metrics` step fails **after**
+the history line has been committed and pushed, so a bad report never costs
+a run its record.
 
 Both tools have unit tests (`harness/test_*.py`), run by `ci` before the
 build.

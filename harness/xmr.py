@@ -64,16 +64,18 @@ PROVISIONAL_BELOW = 8
 XMR_LIMIT = 2.66
 MR_LIMIT = 3.268
 
-# (label, harness key, path inside the harness object, lower clamp, upper clamp)
+# (label, harness key, path inside the harness object, kind)
+# kind "count": integral, floored at 0.  kind "pct": within [0, 100].
 METRICS = [
-    ("t9a vc.wrong_apply", "t9a", ("vc", "wrong_apply"), 0.0, None),
-    ("t9a vc.refused", "t9a", ("vc", "refused"), 0.0, None),
-    ("t9a vc.partial_write", "t9a", ("vc", "partial_write"), 0.0, None),
-    ("t9a base.wrong_apply", "t9a", ("base", "wrong_apply"), 0.0, None),
-    ("r1_lexical mismatches", "r1_lexical", ("mismatches",), 0.0, None),
-    ("r1_defs top1_pct", "r1_defs", ("top1_pct",), 0.0, 100.0),
-    ("r1_defs wrong_pct", "r1_defs", ("wrong_pct",), 0.0, 100.0),
+    ("t9a vc.wrong_apply", "t9a", ("vc", "wrong_apply"), "count"),
+    ("t9a vc.refused", "t9a", ("vc", "refused"), "count"),
+    ("t9a vc.partial_write", "t9a", ("vc", "partial_write"), "count"),
+    ("t9a base.wrong_apply", "t9a", ("base", "wrong_apply"), "count"),
+    ("r1_lexical mismatches", "r1_lexical", ("mismatches",), "count"),
+    ("r1_defs top1_pct", "r1_defs", ("top1_pct",), "pct"),
+    ("r1_defs wrong_pct", "r1_defs", ("wrong_pct",), "pct"),
 ]
+KINDS = {"count": (0.0, None, True), "pct": (0.0, 100.0, False)}  # lower, upper, integral
 
 
 def load_history(path):
@@ -94,35 +96,48 @@ def load_history(path):
     return records
 
 
-def series_for(records, harness, path, lower=None, upper=None):
+def series_for(records, harness, path, kind="count"):
     """(points, gaps): points = [(position, short_commit, value)] in stream order,
-    gaps = short commits with no usable value. Raises ValueError on a value that
-    is present but not a finite number inside the metric's domain."""
+    gaps = short commits with no usable value. A gap is a harness whose
+    `parsed` is False or a metric key that is absent. Anything else that is
+    present but malformed — a non-dict harness or container, a non-boolean
+    `parsed`, a value that is not a finite number of the metric's kind inside
+    its domain — raises ValueError naming the record."""
+    lower, upper, integral = KINDS[kind]
     points, gaps = [], []
     for pos, rec in enumerate(records):
         short = str(rec.get("commit", ""))[:7]
-        h = rec.get(harness)
-        if not isinstance(h, dict) or not h.get("parsed"):
+        where = f"record {pos + 1} ({short}): {harness}.{'.'.join(path)}"
+        if harness not in rec:
+            gaps.append(short)
+            continue
+        h = rec[harness]
+        if not isinstance(h, dict) or not isinstance(h.get("parsed"), bool):
+            raise ValueError(f"{where}: harness object malformed (need a dict with a boolean 'parsed')")
+        if not h["parsed"]:
             gaps.append(short)
             continue
         node = h
         missing = False
         for key in path:
-            if not isinstance(node, dict) or key not in node:
+            if not isinstance(node, dict):
+                raise ValueError(f"{where}: container is not an object: {node!r}")
+            if key not in node:
                 missing = True
                 break
             node = node[key]
         if missing:
             gaps.append(short)
             continue
-        label = f"{harness}.{'.'.join(path)}"
         if isinstance(node, bool) or not isinstance(node, (int, float)):
-            raise ValueError(f"record {pos + 1} ({short}): {label} is not a number: {node!r}")
+            raise ValueError(f"{where}: not a number: {node!r}")
         value = float(node)
         if math.isnan(value) or math.isinf(value):
-            raise ValueError(f"record {pos + 1} ({short}): {label} is not finite: {node!r}")
+            raise ValueError(f"{where}: not finite: {node!r}")
         if (lower is not None and value < lower) or (upper is not None and value > upper):
-            raise ValueError(f"record {pos + 1} ({short}): {label} = {node!r} is outside [{lower}, {upper}]")
+            raise ValueError(f"{where}: {node!r} is outside [{lower}, {upper}]")
+        if integral and value != int(value):
+            raise ValueError(f"{where}: a count must be integral: {node!r}")
         points.append((pos, short, value))
     return points, gaps
 
@@ -146,6 +161,8 @@ def limits(values, positions, lower=None, upper=None):
     mr_bar = sum(mrs) / len(mrs)
     lnpl = centre - XMR_LIMIT * mr_bar
     unpl = centre + XMR_LIMIT * mr_bar
+    if not all(math.isfinite(x) for x in (centre, mr_bar, lnpl, unpl)):
+        raise ValueError("limits are not representable (arithmetic overflow on the values)")
     c_lnpl = max(lnpl, lower) if lower is not None else lnpl
     c_unpl = min(unpl, upper) if upper is not None else unpl
     return centre, mr_bar, (lnpl, unpl), (c_lnpl, c_unpl), MR_LIMIT * mr_bar
@@ -171,13 +188,12 @@ def signals(values, positions, centre, unclamped, clamped, mr_ul):
         for i, m in enumerate(mrs, start=1):
             if m is not None and m > mr_ul:
                 out.append((i, "mr"))
-    if sigma > 0:
-        for i in range(2, len(values)):
-            if not _contiguous(positions, i, 3):
-                continue
-            window = values[i - 2 : i + 1]
-            if sum(1 for v in window if v > hi2) >= 2 or sum(1 for v in window if v < lo2) >= 2:
-                out.append((i, "rule2"))
+    for i in range(2, len(values)):  # strict comparisons: a constant series never fires
+        if not _contiguous(positions, i, 3):
+            continue
+        window = values[i - 2 : i + 1]
+        if sum(1 for v in window if v > hi2) >= 2 or sum(1 for v in window if v < lo2) >= 2:
+            out.append((i, "rule2"))
     for i in range(7, len(values)):
         if not _contiguous(positions, i, 8):
             continue
@@ -207,7 +223,8 @@ def render_metric(label, points, gaps):
         lines.append(f"- limits: not computed (n < {MIN_POINTS})")
         lines.append("")
         return lines
-    lim = limits(values, positions, *_clamps_for(label))
+    lower, upper, _ = KINDS[_kind_for(label)]
+    lim = limits(values, positions, lower, upper)
     if lim is None:
         lines.append(f"- values: {', '.join(fmt(v) for v in values)}")
         lines.append("- limits: not computed (no two consecutive runs; mR̄ undefined)")
@@ -217,7 +234,7 @@ def render_metric(label, points, gaps):
     tag = " (provisional)" if n < PROVISIONAL_BELOW else ""
     lines.append(f"- centre = {fmt(centre)}; mR̄ = {fmt(mr_bar)}; limits{tag} = [{fmt(clamped[0])}, {fmt(clamped[1])}]; mR upper = {fmt(mr_ul)}")
     if mr_bar == 0:
-        lines.append("- mR̄ is 0 so far: the limits have no width, and the next change will read as rule1 (limits are recomputed each run)")
+        lines.append("- mR̄ is 0 so far: the limits have no width; a later change may read as rule1, depending on the limits recomputed with it")
     sig = signals(values, positions, centre, unclamped, clamped, mr_ul)
     if sig:
         for i, rule in sig:
@@ -229,18 +246,18 @@ def render_metric(label, points, gaps):
     return lines
 
 
-def _clamps_for(label):
-    for lab, _h, _p, lower, upper in METRICS:
+def _kind_for(label):
+    for lab, _h, _p, kind in METRICS:
         if lab == label:
-            return lower, upper
-    return None, None
+            return kind
+    raise KeyError(label)
 
 
 def render(records):
     lines = ["# Harness history — process-behaviour report", "",
              f"{len(records)} run(s). Limits = centre ± {XMR_LIMIT}·mR̄; provisional below n = {PROVISIONAL_BELOW}, not computed below n = {MIN_POINTS}. React to signals, not to neighbouring deltas.", ""]
-    for label, harness, path, lower, upper in METRICS:
-        points, gaps = series_for(records, harness, path, lower, upper)
+    for label, harness, path, kind in METRICS:
+        points, gaps = series_for(records, harness, path, kind)
         lines += render_metric(label, points, gaps)
     return "\n".join(lines)
 
