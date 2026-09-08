@@ -45,6 +45,24 @@ A harness whose output could not be parsed is recorded as
 `"parsed": false, "pass": false` — a broken gate leaves a mark, never a gap —
 and the `metrics` run goes red after the line is appended.
 
+## Reading the stream: `REPORT.md`
+
+`harness/xmr.py` renders `history.jsonl` as a process-behaviour report,
+regenerated on the `metrics` branch by every run (`git show
+origin/metrics:REPORT.md`). Per metric: the values in run order, the centre
+line, the natural process limits (centre ± 2.66·mR̄, never the global SD),
+and any signals — `rule1` (a point beyond a limit), `rule2` (two of three
+beyond two sigma on one side), `run8` (eight on one side of centre). Limits
+are not computed below 4 points and are labelled provisional below 8. A
+count is floored at 0 and a percentage capped at 100 for display only; the
+two-sigma zone comes from the unclamped limits, so a clamp never tightens
+detection. A metric that has never moved has zero-width limits, so its first
+change is a `rule1` signal by construction — the intended reading for gates
+expected to sit at 0 or N.
+
+Both tools have unit tests (`harness/test_*.py`), run by `ci` before the
+build.
+
 ## Rules
 
 - `history.jsonl` is generated. Never hand-edit it; a bad line is fixed by

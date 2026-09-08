@@ -79,7 +79,11 @@ jobs:
           cd .metrics
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add history.jsonl
+          # The report is regenerated from the whole stream on every run, so
+          # a malformed line surfaces here as a failed step, never as a
+          # silently wrong chart.
+          python3 ../harness/xmr.py history.jsonl > REPORT.md
+          git add history.jsonl REPORT.md
           # An empty staged diff is the one benign reason not to commit; any
           # other commit failure is real and fails the step.
           if git diff --cached --quiet; then echo "nothing to commit"; exit 0; fi
