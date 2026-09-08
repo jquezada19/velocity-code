@@ -25,6 +25,10 @@ jobs:
           toolchain: stable
       - run: sudo apt-get update && sudo apt-get install -y ripgrep jq
       - run: cargo build --release
+      # yagni: this re-runs what `ci` just ran on the same commit (~2 min);
+      # switch to a workflow_run trigger + artifact download only if the
+      # harness suite grows past ~10 min. The duplication buys a job that
+      # is self-contained and the only one holding a write token.
       # Run all three harnesses and keep going on failure: the point of this
       # job is to RECORD the outcome, red or green. Exit codes are captured
       # per harness and the history step turns them into the line.

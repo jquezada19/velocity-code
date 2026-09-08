@@ -111,10 +111,7 @@ def main(argv):
     ap.add_argument("--commit", required=True, help="commit the run measured")
     ap.add_argument("--run", default="", help="CI run id/url, if any")
     ap.add_argument("--out", required=True, help="history.jsonl to append to")
-    try:
-        a = ap.parse_args(argv)
-    except SystemExit:
-        return 2
+    a = ap.parse_args(argv)  # argparse itself exits 2 on a usage error
     rec = {
         "ts": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "commit": a.commit,
