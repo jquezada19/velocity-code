@@ -72,6 +72,48 @@ a run its record.
 Both tools have unit tests (`harness/test_*.py`), run by `ci` before the
 build.
 
+## Running the loop locally
+
+The same three harnesses, the parser and the report run on a laptop. What
+they need: the Rust toolchain, `python3` (stdlib only), and for the two R1
+harnesses `rg` and `jq` on `PATH` (`brew install ripgrep` on macOS; macOS 15
+and later ship `jq` at `/usr/bin/jq`). Without either, `r1_lexical.sh` exits
+2 and says which is missing; CI installs both itself. From the repository
+root, the commands as the workflows run them, one exit code each, captured
+directly rather than through a pipe:
+
+```bash
+cargo build --release
+mkdir -p harness/out
+bash harness/t9a/run.sh 100 > harness/out/t9a.txt 2>&1; echo "t9a exit=$?"
+PATH="$PWD/target/release:$PATH" bash harness/r/r1_lexical.sh > harness/out/r1_lexical.txt 2>&1; echo "lexical exit=$?"
+PATH="$PWD/target/release:$PATH" bash harness/r/r1_defs.sh > harness/out/r1_defs.txt 2>&1; echo "defs exit=$?"
+```
+
+`run.sh` resolves `target/release/vc` itself; the two R1 scripts take `vc`
+from `PATH`, hence the prefix. Then turn the three outputs into one history
+line and read it, exactly as the `metrics` workflow does, into a scratch
+file. The T9a results path is taken from the `Results:` line `run.sh`
+prints, not from the newest file in `harness/t9a/`: a laptop keeps every
+earlier run's `results-*.jsonl`, and a T9a that exited before writing one
+must be recorded as missing, not as the previous run's counters:
+
+```bash
+T9A=$(sed -n 's/^Results: //p' harness/out/t9a.txt)
+python3 harness/history.py --t9a "$T9A" --r1-lexical harness/out/r1_lexical.txt \
+  --r1-defs harness/out/r1_defs.txt --commit "$(git rev-parse --short HEAD)" \
+  --out /tmp/local-history.jsonl
+python3 harness/xmr.py /tmp/local-history.jsonl
+```
+
+The unit tests for both tools are `python3 -m unittest discover -s harness
+-p 'test_*.py'`, the command CI runs before the build.
+
+Everything a local run writes lands in ignored paths (`harness/out/`,
+`harness/t9a/results-*.jsonl`); `git status` stays clean. A local line is
+scratch: it measures a working tree, not a push to `main`, so it never goes
+into the `metrics` branch — that stream is written by CI alone.
+
 ## Rules
 
 - `history.jsonl` is generated. Never hand-edit it; a bad line is fixed by
