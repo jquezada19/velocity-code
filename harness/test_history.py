@@ -35,6 +35,11 @@ class T9a(unittest.TestCase):
         p = tmp('{"n": 1}\nGate: PASS\n')
         self.assertFalse(history.parse_t9a(history._read(p))["parsed"])
 
+    def test_fractional_bool_string_and_negative_counters_are_malformed(self):
+        for bad in ("0.5", "true", '"0"', "-1"):
+            p = tmp('{"n": 100, "vc": {"wrong_apply": %s, "refused": 100}, "base": {"wrong_apply": 100}, "gate_pass": true}\n' % bad)
+            self.assertFalse(history.parse_t9a(history._read(p))["parsed"], bad)
+
     def test_missing_file(self):
         self.assertFalse(history.parse_t9a(history._read("/nonexistent/x"))["parsed"])
 
@@ -47,6 +52,11 @@ class R1Lexical(unittest.TestCase):
     def test_fail_line_without_counts(self):
         r = history.parse_r1_lexical("R1 MISMATCH [literal] foo\nR1 lexical parity: FAIL — see mismatches above\n")
         self.assertEqual((r["parsed"], r["pass"]), (True, False))
+
+    def test_pass_without_counts_or_with_garbage_is_not_parsed(self):
+        self.assertFalse(history.parse_r1_lexical("R1 lexical parity: PASS\n")["parsed"])
+        self.assertFalse(history.parse_r1_lexical("R1 lexical parity: PASS (garbage)\n")["parsed"])
+        self.assertFalse(history.parse_r1_lexical("R1 lexical parity: PASS (40 queries, 0 mismatches) extra\n")["parsed"])
 
     def test_no_verdict(self):
         self.assertFalse(history.parse_r1_lexical("this gate compares vc against ripgrep; install ripgrep and re-run\n")["parsed"])
@@ -68,6 +78,10 @@ class R1Defs(unittest.TestCase):
         r = history.parse_r1_defs("R1 definitions: top-1 5/5 (..%), negative controls 2/2, confidently-wrong 0/5 (0.00%)\nR1 definitions: PASS\n")
         self.assertFalse(r["parsed"])
 
+    def test_percentage_outside_domain_is_malformed(self):
+        r = history.parse_r1_defs("R1 definitions: top-1 5/5 (101.00%), negative controls 2/2, confidently-wrong 0/5 (0.00%)\nR1 definitions: PASS\n")
+        self.assertFalse(r["parsed"])
+
     def test_stats_without_verdict(self):
         self.assertFalse(history.parse_r1_defs(self.STATS)["parsed"])
 
@@ -85,6 +99,15 @@ class Main(unittest.TestCase):
         lines = [json.loads(l) for l in open(out)]
         self.assertEqual([l["all_pass"] for l in lines], [True, False])
         self.assertFalse(lines[1]["r1_lexical"]["parsed"])
+
+    def test_fractional_counter_through_main_is_not_a_pass(self):
+        t9a = tmp('{"n": 100, "vc": {"wrong_apply": 0.5, "refused": 100}, "base": {"wrong_apply": 100}, "gate_pass": true}\n')
+        lex = tmp("R1 lexical parity: PASS (40 queries, 0 mismatches)\n")
+        defs = tmp(R1Defs.STATS + "R1 definitions: PASS\n")
+        out = tmp("")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(history.main(["--t9a", t9a, "--r1-lexical", lex, "--r1-defs", defs, "--commit", "abc", "--out", out]), 1)
+        self.assertFalse(json.loads(open(out).read())["t9a"]["parsed"])
 
 
 if __name__ == "__main__":

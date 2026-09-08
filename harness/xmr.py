@@ -138,6 +138,8 @@ def series_for(records, harness, path, kind="count"):
             raise ValueError(f"{where}: {node!r} is outside [{lower}, {upper}]")
         if integral and value != int(value):
             raise ValueError(f"{where}: a count must be integral: {node!r}")
+        if integral and abs(node) > 2**53:
+            raise ValueError(f"{where}: a count beyond 2**53 is not exact as a float: {node!r}")
         points.append((pos, short, value))
     return points, gaps
 
@@ -161,11 +163,12 @@ def limits(values, positions, lower=None, upper=None):
     mr_bar = sum(mrs) / len(mrs)
     lnpl = centre - XMR_LIMIT * mr_bar
     unpl = centre + XMR_LIMIT * mr_bar
-    if not all(math.isfinite(x) for x in (centre, mr_bar, lnpl, unpl)):
+    mr_ul = MR_LIMIT * mr_bar
+    if not all(math.isfinite(x) for x in (centre, mr_bar, lnpl, unpl, mr_ul)):
         raise ValueError("limits are not representable (arithmetic overflow on the values)")
     c_lnpl = max(lnpl, lower) if lower is not None else lnpl
     c_unpl = min(unpl, upper) if upper is not None else unpl
-    return centre, mr_bar, (lnpl, unpl), (c_lnpl, c_unpl), MR_LIMIT * mr_bar
+    return centre, mr_bar, (lnpl, unpl), (c_lnpl, c_unpl), mr_ul
 
 
 def _contiguous(positions, i, width):

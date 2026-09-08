@@ -65,6 +65,16 @@ class Limits(unittest.TestCase):
         with self.assertRaises(ValueError):
             xmr.limits([1e308] * 4, seq(4))
 
+    def test_overflowing_moving_range_limit_refuses(self):
+        # individual limits stay finite here but 3.268·mR̄ does not
+        with self.assertRaises(ValueError):
+            xmr.limits([0.0, 6e307, 0.0, 0.0], [0, 1, 3, 5])
+
+    def test_count_beyond_2_pow_53_is_malformed(self):
+        with self.assertRaises(ValueError):
+            xmr.series_for([rec("a1", mism=2**53 + 1)], "r1_lexical", ("mismatches",), "count")
+        xmr.series_for([rec("a1", mism=2**53)], "r1_lexical", ("mismatches",), "count")
+
 
 class Signals(unittest.TestCase):
     def sig(self, values, positions=None, lower=None, upper=None):
@@ -185,6 +195,20 @@ class Signals(unittest.TestCase):
     def test_no_signal_inside_limits(self):
         self.assertEqual(self.sig([10.0, 11.0, 10.5, 11.5, 10.0, 11.0, 10.5, 11.0]), [])
 
+    def test_constant_series_has_no_signals_at_all(self):
+        self.assertEqual(self.sig([7.0] * 10), [])
+
+    def test_a_centre_line_tie_interrupts_a_run(self):
+        # eight 8s, seven 12s, one 10, one 12: centre is exactly 10, the 10 sits on
+        # neither side, so the run of 12s (seven, then a tie) never reaches eight
+        values = [8.0] * 8 + [12.0] * 7 + [10.0] + [12.0]
+        centre, _, unc, cl, mr_ul = xmr.limits(values, seq(len(values)))
+        self.assertEqual(centre, 10.0)
+        rules = xmr.signals(values, seq(len(values)), centre, unc, cl, mr_ul)
+        self.assertIn((7, "run8"), rules)          # the eight 8s complete a run below
+        for i in (14, 15, 16):
+            self.assertNotIn((i, "run8"), rules)    # seven 12s, then the tie: no run above
+
 
 class Series(unittest.TestCase):
     def test_unparsed_harness_is_a_gap_not_a_value(self):
@@ -250,6 +274,13 @@ class Render(unittest.TestCase):
         out = xmr.render(xmr.load_history(self._write([rec("a1"), rec("a2")])))
         self.assertIn("limits: not computed (n < 4)", out)
         self.assertNotIn("centre =", out)
+
+    def test_exactly_four_points_get_numeric_provisional_limits(self):
+        out = xmr.render(xmr.load_history(self._write([rec(f"c{i}", mism=i % 2) for i in range(4)])))
+        section = out.split("### r1_lexical mismatches")[1].split("###")[0]
+        self.assertIn("(provisional)", section)
+        self.assertIn("centre = 0.5", section)
+        self.assertNotIn("not computed", section)
 
     def test_provisional_between_min_and_eight(self):
         out = xmr.render(xmr.load_history(self._write([rec(f"c{i}") for i in range(5)])))

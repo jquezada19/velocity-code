@@ -79,21 +79,25 @@ jobs:
           cd .metrics
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # The report is regenerated from the whole stream on every run. A
-          # report failure must not cost the run its history line: the line
-          # is committed and pushed regardless, REPORT.md is replaced only
-          # on success, and the step fails afterwards.
-          report_rc=0; python3 ../harness/xmr.py history.jsonl > REPORT.new || report_rc=$?
-          if [ "$report_rc" -eq 0 ]; then mv REPORT.new REPORT.md; else rm -f REPORT.new; fi
           git add history.jsonl
-          [ -f REPORT.md ] && git add REPORT.md
           # An empty staged diff is the one benign reason not to commit; any
           # other commit failure is real and fails the step.
-          if git diff --cached --quiet; then echo "nothing to commit"; else
-            git commit -q -m "history: ${GITHUB_SHA::7}"
-            git push origin HEAD:metrics
-          fi
-          if [ "$report_rc" -ne 0 ]; then echo "REPORT.md not regenerated (xmr exit $report_rc); history was still pushed"; exit "$report_rc"; fi
+          if git diff --cached --quiet; then echo "nothing to commit"; exit 0; fi
+          git commit -q -m "history: ${GITHUB_SHA::7}"
+          git push origin HEAD:metrics
+      # Only after the history line is durable: regenerate the report from
+      # the whole stream and publish it as its own commit. Nothing on this
+      # path can cost a run its record; a failure here is a red step with
+      # the history already pushed.
+      - name: Regenerate and push the report
+        run: |
+          cd .metrics
+          python3 ../harness/xmr.py history.jsonl > REPORT.new
+          mv REPORT.new REPORT.md
+          git add REPORT.md
+          if git diff --cached --quiet; then echo "report unchanged"; exit 0; fi
+          git commit -q -m "report: ${GITHUB_SHA::7}"
+          git push origin HEAD:metrics
       # The captured outputs are the diagnostics the failure message points
       # at, so they are uploaded whatever happened above.
       - name: Upload harness outputs

@@ -44,9 +44,9 @@ def parse_t9a(text):
         return {"parsed": False, "pass": False, "error": "empty file"}
     try:
         s = json.loads(lines[-1])
-        n = int(s["n"])
-        vc = {k: int(v) for k, v in s["vc"].items()}
-        base = {k: int(v) for k, v in s["base"].items()}
+        n = _count(s["n"])
+        vc = {k: _count(v) for k, v in s["vc"].items()}
+        base = {k: _count(v) for k, v in s["base"].items()}
         gate = s["gate_pass"]
         # The producer emits a real JSON boolean and these counters; a string
         # "false" or an empty counter object is malformed, not a pass.
@@ -57,7 +57,24 @@ def parse_t9a(text):
     return {"parsed": True, "pass": gate, "n": n, "vc": vc, "base": base}
 
 
-_LEX = re.compile(r"^R1 lexical parity: (PASS|FAIL)(?: \((\d+) queries, (\d+) mismatches\))?")
+def _count(v):
+    """A counter is a non-negative JSON integer — never a bool, float or string."""
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+        raise ValueError(f"counter must be a non-negative integer, got {v!r}")
+    return v
+
+
+def _pct(text):
+    p = float(text)
+    if not 0.0 <= p <= 100.0:
+        raise ValueError(f"percentage outside [0, 100]: {text}")
+    return p
+
+
+# The producer prints exactly one of two shapes (r1_lexical.sh):
+#   R1 lexical parity: PASS (<n> queries, 0 mismatches)
+#   R1 lexical parity: FAIL — see mismatches above
+_LEX = re.compile(r"^R1 lexical parity: (?:(PASS) \((\d+) queries, (\d+) mismatches\)|(FAIL) — see mismatches above)$")
 
 
 def parse_r1_lexical(text):
@@ -66,11 +83,9 @@ def parse_r1_lexical(text):
     for ln in reversed(text.splitlines()):
         m = _LEX.match(ln.strip())
         if m:
-            out = {"parsed": True, "pass": m.group(1) == "PASS"}
-            if m.group(2) is not None:
-                out["queries"] = int(m.group(2))
-                out["mismatches"] = int(m.group(3))
-            return out
+            if m.group(1) == "PASS":
+                return {"parsed": True, "pass": True, "queries": int(m.group(2)), "mismatches": int(m.group(3))}
+            return {"parsed": True, "pass": False}
     return {"parsed": False, "pass": False, "error": "no verdict line"}
 
 
@@ -106,11 +121,11 @@ def _defs_stats(m):
     return {
         "top1": int(m.group(1)),
         "n_pos": int(m.group(2)),
-        "top1_pct": float(m.group(3)),
+        "top1_pct": _pct(m.group(3)),
         "neg_correct": int(m.group(4)),
         "n_neg": int(m.group(5)),
         "confidently_wrong": int(m.group(6)),
-        "wrong_pct": float(m.group(8)),
+        "wrong_pct": _pct(m.group(8)),
     }
 
 
