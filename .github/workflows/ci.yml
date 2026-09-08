@@ -40,7 +40,33 @@ jobs:
       # patch, a `core.fileMode=false` clone, a future non-POSIX runner).
       # A gate that can be silently skipped by a file-mode change is not a
       # gate.
+      # Each harness's stdout is captured under harness/out/ for the run
+      # artifact below. `set -o pipefail` keeps the tee from masking the
+      # harness's exit code — a gate whose failure a pipe can swallow is
+      # not a gate.
+      - name: T9a stale-write gate
+        run: |
+          set -o pipefail
+          mkdir -p harness/out
+          PATH="$PWD/target/release:$PATH" bash harness/t9a/run.sh 100 2>&1 | tee harness/out/t9a.txt
       - name: R1 lexical parity
-        run: PATH="$PWD/target/release:$PATH" bash harness/r/r1_lexical.sh
+        run: |
+          set -o pipefail
+          mkdir -p harness/out
+          PATH="$PWD/target/release:$PATH" bash harness/r/r1_lexical.sh 2>&1 | tee harness/out/r1_lexical.txt
       - name: R1 definitions (Rust)
-        run: PATH="$PWD/target/release:$PATH" bash harness/r/r1_defs.sh
+        run: |
+          set -o pipefail
+          mkdir -p harness/out
+          PATH="$PWD/target/release:$PATH" bash harness/r/r1_defs.sh 2>&1 | tee harness/out/r1_defs.txt
+      # Uploaded on failure too: a red run's outputs are the ones worth
+      # reading. Pinned by SHA for the same reason as the actions above.
+      - name: Upload harness outputs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: harness-outputs
+          path: |
+            harness/out/
+            harness/t9a/results-*.jsonl
+          if-no-files-found: warn

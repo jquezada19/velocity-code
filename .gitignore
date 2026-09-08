@@ -2,3 +2,4 @@
 .vc/
 .superpowers/
 harness/t9a/results-*.jsonl
+harness/out/
