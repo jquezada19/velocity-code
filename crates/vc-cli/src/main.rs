@@ -9,6 +9,7 @@
 
 mod metrics;
 mod output;
+mod worktree;
 
 use clap::Parser;
 use output::CmdOutcome;
@@ -89,6 +90,11 @@ enum Cmd {
         #[arg(long)]
         budget: Option<usize>,
     },
+    /// Read-only reports over the git worktrees of a repository.
+    Worktree {
+        #[command(subcommand)]
+        cmd: WorktreeCmd,
+    },
     Read {
         /// `path[:a-b]` (1-based, inclusive). Omitted when `--symbol` is
         /// given instead — checked in `cmd_read`, not `clap`, so both "no
@@ -100,6 +106,45 @@ enum Cmd {
         symbol: Option<String>,
         #[arg(long)]
         budget: Option<usize>,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum WorktreeCmd {
+    /// Classify every LINKED worktree (the main worktree is skipped) as
+    /// exactly one of, in priority order: prunable (directory gone) ·
+    /// stale (its branch ref was deleted — HEAD is unborn, so dirtiness
+    /// cannot be measured) · dirty (uncommitted changes or untracked
+    /// files; wins over every merge-related state) · detached · base
+    /// (checked out on the base branch itself) · merged (HEAD is an
+    /// ancestor of base) · conflict (`merge-tree --write-tree` exit 1)
+    /// · unknown (a git query failed, e.g. git < 2.38) · stale (merges
+    /// cleanly but the last commit is older than --stale-days) ·
+    /// merge-ready. Report-only: nothing is removed, pruned, checked
+    /// out, reset or merged, and no network access happens unless
+    /// `--fetch` is given. Exit 0 on every completed scan; non-zero
+    /// only when the path is not a git work tree, `git` cannot run, or
+    /// no base branch can be resolved.
+    ///
+    /// One line per worktree: `<state>\t<path>\t<branch>\t<ahead>/<behind>\t<reason>`,
+    /// then a `summary:` line. `--json` emits one object with a
+    /// `worktrees` array (one object per worktree) and `counts`.
+    Doctor {
+        /// Repository to scan (any path inside it). Default: the CWD.
+        #[arg(long)]
+        repo: Option<std::path::PathBuf>,
+        /// Base ref to compare against. Default: origin/HEAD's target,
+        /// else `main`, else `master`; the summary says which won.
+        #[arg(long)]
+        base: Option<String>,
+        /// A worktree that merges cleanly but whose last commit is older
+        /// than this many days is `stale`, not `merge-ready`.
+        #[arg(long, default_value_t = worktree::DEFAULT_STALE_DAYS)]
+        stale_days: u64,
+        /// Run `git fetch` first so a remote-tracking base is current.
+        /// The only network access the doctor ever makes.
+        #[arg(long)]
+        fetch: bool,
     },
 }
 
@@ -163,6 +208,7 @@ fn verb_name(cmd: &Cmd) -> &'static str {
         Cmd::Query { .. } => "query",
         Cmd::Outline { .. } => "outline",
         Cmd::Read { .. } => "read",
+        Cmd::Worktree { .. } => "worktree",
     }
 }
 
@@ -202,7 +248,42 @@ fn dispatch(root: &Path, cwd: &Path, cmd: &Cmd) -> VcResult<CmdOutcome> {
             symbol,
             budget,
         } => cmd_read(root, cwd, path.as_deref(), symbol.as_deref(), *budget),
+        Cmd::Worktree {
+            cmd:
+                WorktreeCmd::Doctor {
+                    repo,
+                    base,
+                    stale_days,
+                    fetch,
+                },
+        } => cmd_worktree_doctor(
+            cwd,
+            &worktree::DoctorArgs {
+                repo: repo.as_deref(),
+                base: base.as_deref(),
+                stale_days: *stale_days,
+                fetch: *fetch,
+            },
+        ),
     }
+}
+
+/// `vc worktree doctor` — see [`worktree`]. Takes `cwd`, not the vc
+/// `root`: the repository scanned is the GIT repository around the CWD
+/// (or `--repo`), which need not be the `.vc` root at all.
+fn cmd_worktree_doctor(cwd: &Path, args: &worktree::DoctorArgs<'_>) -> VcResult<CmdOutcome> {
+    let rep = worktree::doctor(cwd, args)?;
+    let files = rep.worktrees.len();
+    Ok(CmdOutcome {
+        human: worktree::format_human(&rep),
+        json: worktree::to_json(&rep),
+        files,
+        edits: 0,
+        epoch8: String::new(),
+        warning: None,
+        bytes_out: None,
+        naive_bytes: None,
+    })
 }
 
 /// Rebase a user-supplied path argument — as typed on the command line,
