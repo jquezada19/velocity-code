@@ -69,8 +69,12 @@ class Limits(unittest.TestCase):
         self.assertAlmostEqual(mr_bar, 3.0)
 
     def test_overflowing_values_refuse_instead_of_infinite_limits(self):
+        # a constant 1e308 is representable (exact centre, zero range) — the
+        # overflow case is a series whose moving range itself is infinite
+        centre, mr_bar, *_ = xmr.limits([1e308] * 4, seq(4))
+        self.assertEqual((centre, mr_bar), (1e308, 0.0))
         with self.assertRaises(ValueError):
-            xmr.limits([1e308] * 4, seq(4))
+            xmr.limits([1e308, -1e308, 1e308, -1e308], seq(4))
 
     def test_overflowing_moving_range_limit_refuses(self):
         # individual limits stay finite here but 3.268·mR̄ does not
