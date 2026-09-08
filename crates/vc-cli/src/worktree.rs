@@ -230,7 +230,7 @@ fn escape_cell(s: &str) -> String {
         .replace('\r', "\\r")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Prunable,
     Dirty,
