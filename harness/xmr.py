@@ -156,7 +156,10 @@ def limits(values, positions, lower=None, upper=None):
     """Centre, mR̄, unclamped (lnpl, unpl), clamped (lnpl, unpl), mR upper limit.
     Returns None when no two runs are consecutive (mR̄ undefined)."""
     n = len(values)
-    centre = sum(values) / n
+    # Average the offsets from the first observation: a constant series then
+    # keeps its exact value (a plain mean of forty-five 98.51s is 98.50999…,
+    # which with mR̄ = 0 would turn every point into a false signal).
+    centre = values[0] + math.fsum(v - values[0] for v in values) / n
     mrs = [m for m in moving_ranges(values, positions) if m is not None]
     if not mrs:
         return None

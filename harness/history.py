@@ -74,7 +74,7 @@ def _pct(text):
 # The producer prints exactly one of two shapes (r1_lexical.sh):
 #   R1 lexical parity: PASS (<n> queries, 0 mismatches)
 #   R1 lexical parity: FAIL — see mismatches above
-_LEX = re.compile(r"^R1 lexical parity: (?:(PASS) \((\d+) queries, (\d+) mismatches\)|(FAIL) — see mismatches above)$")
+_LEX = re.compile(r"^R1 lexical parity: (?:(PASS) \((\d+) queries, (0) mismatches\)|(FAIL) — see mismatches above)$")
 
 
 def parse_r1_lexical(text):
@@ -91,9 +91,10 @@ def parse_r1_lexical(text):
 
 _DEFS = re.compile(
     r"^R1 definitions: top-1 (\d+)/(\d+) \((\d+(?:\.\d+)?)%\), negative controls (\d+)/(\d+), "
-    r"confidently-wrong (\d+)/(\d+) \((\d+(?:\.\d+)?)%\)"
+    r"confidently-wrong (\d+)/(\d+) \((\d+(?:\.\d+)?)%\)$"
 )
-_DEFS_VERDICT = re.compile(r"^R1 definitions: (PASS|FAIL)")
+# The producer prints exactly `R1 definitions: PASS` or `R1 definitions: FAIL — <reason>`.
+_DEFS_VERDICT = re.compile(r"^R1 definitions: (?:(PASS)|(FAIL) — .+)$")
 
 
 def parse_r1_defs(text):
@@ -111,7 +112,7 @@ def parse_r1_defs(text):
                 return {"parsed": False, "pass": False, "error": f"stats line: {e}"}
         v = _DEFS_VERDICT.match(s)
         if v:
-            verdict = v.group(1)
+            verdict = "PASS" if v.group(1) else "FAIL"
     if stats is None or verdict is None:
         return {"parsed": False, "pass": False, "error": "stats or verdict line missing"}
     return {"parsed": True, "pass": verdict == "PASS", **stats}

@@ -42,6 +42,13 @@ class Limits(unittest.TestCase):
         # a valid value at the clamp is inside the limits either way
         self.assertEqual([r for _, r in xmr.signals(values, seq(4), centre, unclamped, clamped, mr_ul) if r == "rule1"], [])
 
+    def test_decimal_constant_series_keeps_its_exact_centre(self):
+        values = [98.51] * 45
+        centre, mr_bar, unc, cl, mr_ul = xmr.limits(values, seq(45), 0.0, 100.0)
+        self.assertEqual(centre, 98.51)
+        self.assertEqual(mr_bar, 0)
+        self.assertEqual(xmr.signals(values, seq(45), centre, unc, cl, mr_ul), [])
+
     def test_constant_series_has_zero_width(self):
         centre, mr_bar, unclamped, clamped, _ = xmr.limits([100.0] * 8, seq(8))
         self.assertEqual(mr_bar, 0)
@@ -104,6 +111,23 @@ class Signals(unittest.TestCase):
         self.assertIn((12, "rule2"), rules)
         self.assertNotIn((11, "rule2"), rules)   # only one high point in that window
         self.assertNotIn((12, "rule1"), rules)
+
+    def test_rule2_pair_positions_and_same_side_requirement(self):
+        base = [10.0, 11.0] * 5
+        # pair at window positions (0,1): highs then an ordinary point
+        v = base + [14.5, 14.5, 10.5]
+        centre, _, unc, cl, mr_ul = xmr.limits(v, seq(13))
+        self.assertIn((12, "rule2"), xmr.signals(v, seq(13), centre, unc, cl, mr_ul))
+        # pair at (1,2)
+        v = base + [10.5, 14.5, 14.5]
+        centre, _, unc, cl, mr_ul = xmr.limits(v, seq(13))
+        self.assertIn((12, "rule2"), xmr.signals(v, seq(13), centre, unc, cl, mr_ul))
+        # one high and one low extreme are not a same-side pair
+        v = base + [14.5, 10.5, 6.5]
+        centre, _, unc, cl, mr_ul = xmr.limits(v, seq(13))
+        hi2 = centre + 2 * (unc[1] - centre) / 3; lo2 = centre - 2 * (unc[1] - centre) / 3
+        self.assertGreater(14.5, hi2); self.assertLess(6.5, lo2)   # both are beyond two sigma, on opposite sides
+        self.assertEqual([r for _, r in xmr.signals(v, seq(13), centre, unc, cl, mr_ul) if r == "rule2"], [])
 
     def test_rule2_low_side(self):
         base = [10.0, 11.0] * 5
@@ -296,6 +320,15 @@ class Render(unittest.TestCase):
         # [0,0,0,1]: the 1 enters mR̄ and widens the limits — documented, and pinned
         out = xmr.render(xmr.load_history(self._write([rec("c0"), rec("c1"), rec("c2"), rec("c3", mism=1)])))
         self.assertNotIn("signal rule1", out.split("### r1_lexical mismatches")[1].split("###")[0])
+
+    def test_valid_history_exits_zero_and_prints_the_report(self):
+        import contextlib, io
+        path = self._write([rec(f"c{i}") for i in range(8)])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(xmr.main([path]), 0)
+        self.assertIn("### t9a vc.wrong_apply", buf.getvalue())
+        self.assertIn("8 run(s)", buf.getvalue())
 
     def test_malformed_line_is_an_error_not_a_value(self):
         path = self._write([rec("a1")], extra_line="{not json")

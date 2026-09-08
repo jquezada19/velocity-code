@@ -58,6 +58,9 @@ class R1Lexical(unittest.TestCase):
         self.assertFalse(history.parse_r1_lexical("R1 lexical parity: PASS (garbage)\n")["parsed"])
         self.assertFalse(history.parse_r1_lexical("R1 lexical parity: PASS (40 queries, 0 mismatches) extra\n")["parsed"])
 
+    def test_pass_with_nonzero_mismatches_is_not_the_producer_shape(self):
+        self.assertFalse(history.parse_r1_lexical("R1 lexical parity: PASS (40 queries, 1 mismatches)\n")["parsed"])
+
     def test_no_verdict(self):
         self.assertFalse(history.parse_r1_lexical("this gate compares vc against ripgrep; install ripgrep and re-run\n")["parsed"])
 
@@ -82,6 +85,11 @@ class R1Defs(unittest.TestCase):
         r = history.parse_r1_defs("R1 definitions: top-1 5/5 (101.00%), negative controls 2/2, confidently-wrong 0/5 (0.00%)\nR1 definitions: PASS\n")
         self.assertFalse(r["parsed"])
 
+    def test_trailing_garbage_and_passing_are_not_parsed(self):
+        self.assertFalse(history.parse_r1_defs(self.STATS.rstrip("\n") + " extra\nR1 definitions: PASS\n")["parsed"])
+        self.assertFalse(history.parse_r1_defs(self.STATS + "R1 definitions: PASSING\n")["parsed"])
+        self.assertFalse(history.parse_r1_defs(self.STATS + "R1 definitions: FAIL\n")["parsed"])  # FAIL always carries a reason
+
     def test_stats_without_verdict(self):
         self.assertFalse(history.parse_r1_defs(self.STATS)["parsed"])
 
@@ -99,6 +107,22 @@ class Main(unittest.TestCase):
         lines = [json.loads(l) for l in open(out)]
         self.assertEqual([l["all_pass"] for l in lines], [True, False])
         self.assertFalse(lines[1]["r1_lexical"]["parsed"])
+
+    def test_each_parsed_but_failed_verdict_exits_one_through_main(self):
+        t9a_ok = tmp('{"n": 100, "vc": {"wrong_apply": 0, "refused": 100}, "base": {"wrong_apply": 100}, "gate_pass": true}\n')
+        t9a_fail = tmp('{"n": 100, "vc": {"wrong_apply": 3, "refused": 97}, "base": {"wrong_apply": 100}, "gate_pass": false}\n')
+        lex_ok = tmp("R1 lexical parity: PASS (40 queries, 0 mismatches)\n")
+        lex_fail = tmp("R1 MISMATCH [literal] q\nR1 lexical parity: FAIL — see mismatches above\n")
+        defs_ok = tmp(R1Defs.STATS + "R1 definitions: PASS\n")
+        defs_fail = tmp("R1 definitions: top-1 4/5 (80.00%), negative controls 2/2, confidently-wrong 0/5 (0.00%)\nR1 definitions: FAIL — top-1 80.00% < 98% threshold\n")
+        for name, args in (("t9a", [t9a_fail, lex_ok, defs_ok]), ("r1_lexical", [t9a_ok, lex_fail, defs_ok]), ("r1_defs", [t9a_ok, lex_ok, defs_fail])):
+            out = tmp("")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(history.main(["--t9a", args[0], "--r1-lexical", args[1], "--r1-defs", args[2], "--commit", "abc", "--out", out]), 1, name)
+            rec = json.loads(open(out).read())
+            self.assertTrue(rec[name]["parsed"], name)
+            self.assertFalse(rec[name]["pass"], name)
+            self.assertFalse(rec["all_pass"])
 
     def test_fractional_counter_through_main_is_not_a_pass(self):
         t9a = tmp('{"n": 100, "vc": {"wrong_apply": 0.5, "refused": 100}, "base": {"wrong_apply": 100}, "gate_pass": true}\n')
