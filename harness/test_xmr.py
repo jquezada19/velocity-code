@@ -50,10 +50,18 @@ class Signals(unittest.TestCase):
         rules = {(i, r) for i, r in xmr.signals(values, centre, unc, cl)}
         self.assertIn((11, "run8"), rules)
 
+    def test_mr_signal_on_a_jump_between_neighbours(self):
+        # steady small wobble, then one large step: the X chart may stay inside
+        # its limits but the moving-range chart flags the step itself
+        values = [10.0, 10.5, 10.0, 10.5, 10.0, 10.5, 10.0, 10.5, 10.0, 10.5, 13.0, 12.6]
+        centre, _, unc, cl, mr_ul = xmr.limits(values)
+        rules = {(i, r) for i, r in xmr.signals(values, centre, unc, cl, mr_ul)}
+        self.assertIn((10, "mr"), rules)
+
     def test_no_signal_inside_limits(self):
         values = [10.0, 11.0, 10.5, 11.5, 10.0, 11.0, 10.5, 11.0]
-        centre, _, unc, cl, _ = xmr.limits(values)
-        self.assertEqual(xmr.signals(values, centre, unc, cl), [])
+        centre, _, unc, cl, mr_ul = xmr.limits(values)
+        self.assertEqual(xmr.signals(values, centre, unc, cl, mr_ul), [])
 
     def test_rule2_zone_uses_unclamped_limits(self):
         # a lower clamp at 0 must not narrow the two-sigma zone

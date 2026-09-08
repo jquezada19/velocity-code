@@ -52,7 +52,7 @@ regenerated on the `metrics` branch by every run (`git show
 origin/metrics:REPORT.md`). Per metric: the values in run order, the centre
 line, the natural process limits (centre ± 2.66·mR̄, never the global SD),
 and any signals — `rule1` (a point beyond a limit), `rule2` (two of three
-beyond two sigma on one side), `run8` (eight on one side of centre). Limits
+beyond two sigma on one side), `run8` (eight on one side of centre), `mr` (a moving range beyond 3.268·mR̄). Limits
 are not computed below 4 points and are labelled provisional below 8. A
 count is floored at 0 and a percentage capped at 100 for display only; the
 two-sigma zone comes from the unclamped limits, so a clamp never tightens

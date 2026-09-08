@@ -28,6 +28,8 @@ Signals, each named on the point that completes it:
 - rule1  a point beyond a natural process limit
 - rule2  two of three successive points beyond two sigma on the same side
 - run8   eight successive points on one side of the centre line
+- mr     a moving range beyond its own upper limit (3.268 · mR̄) — the
+         moving-range chart is the other half of XmR
 
 Sample size: below MIN_POINTS no limits are computed (the values are listed
 as-is); from MIN_POINTS up to PROVISIONAL_BELOW the limits are printed but
@@ -113,10 +115,14 @@ def limits(values, lower=None, upper=None):
     return centre, mr_bar, (lnpl, unpl), (c_lnpl, c_unpl), MR_LIMIT * mr_bar
 
 
-def signals(values, centre, unclamped, clamped):
+def signals(values, centre, unclamped, clamped, mr_ul=None):
     """List of (index, rule) — index is the point that completes the signal."""
     out = []
     lnpl, unpl = unclamped
+    if mr_ul is not None and mr_ul > 0:
+        for i in range(1, len(values)):
+            if abs(values[i] - values[i - 1]) > mr_ul:
+                out.append((i, "mr"))
     c_lnpl, c_unpl = clamped
     sigma = (unpl - centre) / 3.0  # one sigma-equivalent from mR̄
     hi2, lo2 = centre + 2 * sigma, centre - 2 * sigma
@@ -159,7 +165,7 @@ def render_metric(label, points, gaps, lower, upper):
     lines.append(f"- centre = {fmt(centre)}; mR̄ = {fmt(mr_bar)}; limits{tag} = [{fmt(clamped[0])}, {fmt(clamped[1])}]; mR upper = {fmt(mr_ul)}")
     if mr_bar == 0:
         lines.append("- mR̄ is 0: the metric has never moved, so its first change will be a rule1 signal")
-    sig = signals(values, centre, unclamped, clamped)
+    sig = signals(values, centre, unclamped, clamped, mr_ul)
     if sig:
         for i, rule in sig:
             lines.append(f"- signal {rule} at {points[i][0]} (value {fmt(values[i])})")
